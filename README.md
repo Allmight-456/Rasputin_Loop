@@ -1,4 +1,4 @@
-# Loop
+# <img width="25" height="25" alt="loop" src="https://github.com/user-attachments/assets/20c20ad6-7a80-49eb-aa2e-5a0cf3cc1ac4" /> Loop
 
 A Slack-native AI agent built on [Strands Agents](https://strandsagents.com/).
 
