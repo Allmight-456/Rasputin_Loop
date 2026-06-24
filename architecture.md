@@ -37,7 +37,8 @@ Strands Agent
    • model       = AnthropicModel(client_args={api_key, base_url?}, model_id, max_tokens=2048)
    • system_prompt = Loop persona (Slack mrkdwn, concise, tool guidance)
    • tools       = [slack, slack_send_message, calculator, think] (+ MCP tools)
-   • memory      = MemoryManager(stores=[SqliteMemoryStore()], …)
+   • memory      = MemoryManager(stores=[_memory_store()], injection=provenance fmt)
+                   _memory_store(): sqlite FTS5 (default) | hybrid libSQL+vectors (RRF)
    • hooks       = [LoopTracer, Guardrails]   callback_handler = reasoning_callback
         │           │
         │           ├─ LoopTracer  → log + persist every model call / tool call / reasoning (steps table)
@@ -61,7 +62,9 @@ final text → Slack thread;  one JSON telemetry line + interactions row recorde
 | `loop/guardrails.py` | `Guardrails` (`HookProvider`): enforcing tool-call limits via `cancel_tool`, with per-rule env toggles. |
 | `loop/observability.py` | `Interaction` + `record()` (edge telemetry), `record_step()`, `record_eval()`; owns the `interactions` / `steps` / `eval_results` tables. |
 | `loop/eval.py` | `loop-eval` CLI: runs `evals/golden.json` through the real agent and scores tool selection + reply expectations. |
-| `loop/storage.py` | `SqliteMemoryStore` — implements the Strands `MemoryStore` protocol over local SQLite. **Episodic + provenance-stamped:** every memory is auto-tagged with who/where/when (from `RequestState`) into dedicated columns; recall is **FTS5** (BM25 + recency) with a sanitized query and a `LIKE` fallback. |
+| `loop/storage.py` | `SqliteMemoryStore` (default backend) — Strands `MemoryStore` over local SQLite. **Episodic + provenance-stamped:** every memory auto-tagged with who/where/when (from `RequestState`); recall is **FTS5** (BM25 + recency) with a sanitized query + `LIKE` fallback; exact-content dedup on write. |
+| `loop/vector_store.py` | `HybridMemoryStore` (opt-in, `LOOP_MEMORY_BACKEND=hybrid`) — same contract over **libSQL/Turso**: fuses FTS5 (BM25) + native vector search (`F32_BLOB`/`vector_top_k`) via **Reciprocal Rank Fusion** for hybrid Agentic-RAG recall. Same provenance + dedup. |
+| `loop/embeddings.py` | Pluggable text embedder for the hybrid store: `fastembed` (local, no key — default), `minimax`/`openai` (hosted), `hashing` (dep-free fallback). |
 | `loop/__init__.py` | Version marker (`0.3.1`). |
 
 ## Model provider
@@ -134,12 +137,18 @@ All telemetry tables are opened on a separate connection from the memory store
   is worth persisting via `add_memory` (system prompt steers it to save
   decisions/facts/preferences/episodes, skip chit-chat); nothing is auto-extracted.
 
+**Memory backends (env `LOOP_MEMORY_BACKEND`):**
+- `sqlite` (default) — FTS5 lexical recall, zero deps, no API key.
+- `hybrid` (aliases `libsql`/`turso`/`vector`) — libSQL/Turso **hybrid** recall:
+  FTS5 + semantic vectors fused with RRF (`loop/vector_store.py`); needs
+  `pip install -e ".[vector]"` + embeddings (`fastembed` local, no key by
+  default). Verified live (memory add→recall through MiniMax M3). See
+  `docs/vector-memory.md`.
+
 **Remaining data-layer gaps (see `progress.md` Pillar 3):**
-- Recall is lexical (FTS5), not yet **semantic**. The optional libSQL/Turso
-  vector backend (pluggable embeddings) lives on the `feat/vector-memory-turso`
-  branch — kept off `main` until it can be verified end-to-end.
 - Scoping columns (channel/team/user) are stored and returned but `search()`
   ranks globally; per-scope filtering is a small follow-up.
+- Dedup is exact-content only; near-duplicate (semantic) dedup is a future step.
 
 ## Extensibility — MCP tools at runtime
 

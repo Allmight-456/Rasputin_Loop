@@ -13,7 +13,9 @@ There is **one brain** — the agent. No intent parser, no command router, no ex
 | Capability | What it means |
 |---|---|
 | 🤖 **Strands agent** | One agent loop decides what to do; replies in Slack `mrkdwn`. |
-| 🧠 **Episodic memory** | Crucial facts/decisions/episodes persisted in SQLite, each **stamped with who/where/when**; recalled by **FTS5** full-text search and auto-injected (with provenance) before each reply. The agent is the filter — it saves signal, skips chit-chat. |
+| 🧠 **Episodic memory** | Crucial facts/decisions/episodes persisted in SQLite, each **stamped with who/where/when**; auto-injected (with provenance) before each reply. The agent is the filter — it saves signal, skips chit-chat, and de-dupes. |
+| 🔎 **Hybrid RAG recall** | Optional libSQL/**Turso** backend fusing **FTS5 (lexical) + semantic vectors** via Reciprocal Rank Fusion. Local embeddings (`fastembed`) — **no API key**. `LOOP_MEMORY_BACKEND=hybrid`. |
+| ✨ **Slack AI Assistant** | Native Slack AI app pane — suggested prompts + live "is thinking…" status, routed to the same agent. `LOOP_SLACK_ASSISTANT=on`. |
 | 👥 **Multi-app support** | Run **Loop _and_ Rasputin_Loop** (and more) in one process — each its own bot, its own agent, its own persona. |
 | 📎 **File & image reading** | Images go to the model natively (M3 is multimodal); text/code/JSON inlined; PDFs extracted (`pypdf`). |
 | 🛠️ **Tools** | `slack`, `slack_send_message`, `calculator`, `think`, plus runtime **MCP** tools. |
@@ -54,7 +56,7 @@ Telemetry tags every interaction `"<app>:<entrypoint>"` (e.g. `rasputin:app_ment
 | `think` | `strands_tools.think` | Structured reasoning for hard problems. |
 | *(MCP tools)* | `LOOP_MCP_SERVERS` | Any stdio MCP server's tools, loaded at runtime. |
 
-**Required Slack bot scopes:** `app_mentions:read`, `chat:write`, `commands`, `reactions:write`, `files:read`, `channels:history`, `groups:history`, `im:history`, `users:read`.
+**Required Slack bot scopes:** `app_mentions:read`, `chat:write`, `commands`, `reactions:write`, `files:read`, `channels:history`, `groups:history`, `im:history`, `users:read`. For the native **AI Assistant** pane add `assistant:write` + enable the "Agents & AI Apps" feature (see [`docs/slack-assistant.md`](docs/slack-assistant.md)).
 
 ---
 
@@ -145,7 +147,9 @@ Loop ships with the foundations for running an agent in production (see [`progre
 
 Local **SQLite** at `DATABASE_PATH` (default `./data/loop.db`), no external services. Tables: `memory_entries` (long-term memory — provenance columns `author/channel/team/source/thread_ts/kind` + `metadata` JSON), `memory_fts` (FTS5 mirror for ranked recall), `interactions` (edge telemetry), `steps` (per-step traces), `eval_results` (eval runs). The committed `data/loop.db` carries the conversation/telemetry history.
 
-Memory is **episodic and provenance-stamped**: the `add_memory` tool only carries content, so the store auto-attaches *who said it, in which channel/workspace, via which app, and when* (from the request) — recall can then say "_per @alice in #infra on 2026-06-20_". Search is **FTS5** (`bm25()` + recency) with a sanitized, injection-safe query and a `LIKE` fallback. Run the storage tests with `python -m tests.test_memory` (no pytest/key needed).
+Memory is **episodic and provenance-stamped**: the `add_memory` tool only carries content, so the store auto-attaches *who said it, in which channel/workspace, via which app, and when* (from the request) — recall can then say "_per @alice in #infra on 2026-06-20_". Default search is **FTS5** (`bm25()` + recency) with a sanitized, injection-safe query and a `LIKE` fallback; exact-duplicate content is de-duped on write. Run the storage tests with `python -m tests.test_memory` (no pytest/key needed).
+
+**Hybrid RAG (optional):** set `LOOP_MEMORY_BACKEND=hybrid` (after `pip install -e ".[vector]"`) to recall over **libSQL/Turso**, fusing FTS5 (lexical) with semantic vector search (`F32_BLOB`/`vector_top_k`) via Reciprocal Rank Fusion — so *"where's the outage runbook?"* finds *"the playbook lives in Notion under SRE"* even with no shared words. Embeddings default to local **`fastembed`** (no API key). See [`docs/vector-memory.md`](docs/vector-memory.md). For the native **Slack AI Assistant** pane, see [`docs/slack-assistant.md`](docs/slack-assistant.md).
 
 ---
 
@@ -157,13 +161,16 @@ loop/
   slack_app.py     # multi-app discovery + Socket Mode handlers, file download
   agent.py         # builds one Strands agent per app (+ persona), runs it
   storage.py       # SqliteMemoryStore — episodic, provenance-stamped, FTS5 recall
+  vector_store.py  # HybridMemoryStore — libSQL/Turso FTS5 + vector (RRF) hybrid RAG
+  embeddings.py    # pluggable embedder (fastembed local / minimax / openai / hashing)
   context.py       # per-request state (ContextVar) for hooks
   tracing.py       # step traces (LoopTracer) + reasoning callback
   guardrails.py    # tool-call circuit breakers
   observability.py # interaction/step/eval telemetry + SQLite tables
   eval.py          # `loop-eval` runner
 evals/golden.json  # golden eval set
-tests/test_memory.py # storage-layer tests (no pytest/key needed)
+tests/             # storage-layer tests (memory + hybrid; no pytest/key needed)
+docs/              # vector-memory.md (hybrid RAG) · slack-assistant.md
 architecture.md    # how it's wired (source of truth)
 progress.md        # status + 5-Pillars roadmap
 ```

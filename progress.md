@@ -59,10 +59,15 @@ memory is now **episodic + provenance-stamped + full-text searchable**.
   the store attaches it); surfaced back to the model via a custom injection format.
 - [x] **FTS5 retrieval** — BM25 + recency, sanitized query, `LIKE` fallback.
       No new deps, no API key. Tested in `tests/test_memory.py`.
+- [x] **Hybrid semantic retrieval** — `LOOP_MEMORY_BACKEND=hybrid` adds libSQL/
+      Turso native vector search fused with FTS5 via RRF (`vector_store.py`),
+      pluggable embeddings (`fastembed` local, no key). Merged to `main`, verified
+      live (memory add→recall through MiniMax M3). See `docs/vector-memory.md`.
+- [x] Exact-content dedup on write (both backends).
 - [ ] Per-scope **filtering** in `search()` (columns + metadata are there; ranking
       is still global).
-- [ ] **Semantic retrieval** — libSQL/Turso vector backend + pluggable embeddings
-      on `feat/vector-memory-turso` (experimental; off `main` until verifiable).
+- [ ] Near-duplicate (semantic) dedup; the model can still re-save a re-phrased
+      fact on recall (prompt nudge added; exact dups are caught).
 
 ### 04 — Orchestration · _Patterns that scale_  — ⚠️ improving
 Guardrails add runaway-loop, repeat, and token-budget circuit breakers. Still
@@ -113,6 +118,23 @@ prompt edit could silently regress quality and we'd never know.
 ---
 
 ## Status log
+- **2026-06-24 (v0.4.0)** — **Hybrid RAG memory + Slack AI Assistant merged to
+  `main`, verified live.** With the MiniMax key (in `ANTHROPIC_AUTH_TOKEN`) and
+  `assistant:write` granted on Rasputin_Loop, both branches were tested and
+  merged. (1) **Hybrid memory** (`LOOP_MEMORY_BACKEND=hybrid`): libSQL/Turso FTS5
+  + native vector search (`F32_BLOB`/`vector_top_k`) fused via **RRF**; embeddings
+  pluggable, default `fastembed` (local, **no key**; confirmed MiniMax `embo-01`
+  needs only the key — **no Group ID** on api.minimax.io). Verified end-to-end: a
+  live agent turn saved then **semantically recalled** ("runbook for outages" →
+  "playbook in Notion under SRE") **with provenance citation**, and `loop-eval`
+  memory cases pass on the hybrid backend. (2) **Exact-content dedup** on write +
+  prompt nudge to not re-save on recall (model can still re-phrase → near-dup is a
+  known follow-up). (3) **Slack AI Assistant** (`LOOP_SLACK_ASSISTANT=on`):
+  suggested prompts + "is thinking…" status, routed to the same agent; both apps
+  connected live and attached the assistant cleanly. `.env` set to
+  `hybrid`+`fastembed`+assistant-on; `pip install -e ".[vector]"`. Bumped to
+  v0.4.0. **Open:** human round-trip in the Rasputin_Loop assistant *pane*
+  (needs the Agents&AI-Apps feature + assistant_thread_* events subscribed).
 - **2026-06-24 (later)** — **Episodic memory overhaul (Pillar 03), shipped to
   `main` — no new deps, no API key.** `SqliteMemoryStore` now: (1) **stamps
   provenance** on every memory (author/channel/team/source/thread_ts/date) pulled

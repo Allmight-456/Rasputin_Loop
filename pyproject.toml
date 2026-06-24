@@ -1,6 +1,6 @@
 [project]
 name = "loop"
-version = "0.3.1"
+version = "0.4.0"
 description = "Loop — a Slack-native AI agent built on Strands"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,8 +14,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Experimental semantic memory (feat/vector-memory-turso): libSQL/Turso native
-# vector search + local embeddings. fastembed runs in-process (no API key).
+# Hybrid (lexical + semantic) memory: libSQL/Turso native vector search + local
+# embeddings. fastembed runs in-process (no API key). Enable with
+# LOOP_MEMORY_BACKEND=hybrid. See docs/vector-memory.md.
 vector = [
     "libsql-experimental>=0.0.40",
     "fastembed>=0.4.0",
