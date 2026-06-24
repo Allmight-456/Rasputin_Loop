@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass, field
 from typing import Any
 
 from mcp import StdioServerParameters, stdio_client
@@ -30,11 +31,31 @@ from strands.tools.mcp import MCPClient
 from strands_tools import calculator, slack, think
 from strands_tools.slack import slack_send_message
 
+from loop import context as reqctx
+from loop.guardrails import Guardrails
 from loop.storage import SqliteMemoryStore
+from loop.tracing import LoopTracer, reasoning_callback
 
 log = logging.getLogger("loop.agent")
 
-_agent: Agent | None = None
+_agents: dict[str, Agent] = {}
+
+
+@dataclass
+class AgentRun:
+    """Result of one agent invocation: the reply text plus the telemetry the
+    observability layer records (tokens, tools used, model, reasoning, etc.)."""
+
+    text: str
+    model_id: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    tool_calls: list[str] = field(default_factory=list)
+    model_calls: int = 0
+    guardrail_hits: int = 0
+    reasoning: str = ""
+    stop_reason: str | None = None
 
 
 def _build_model() -> AnthropicModel:
@@ -71,6 +92,8 @@ When the user asks a question:
 - "what did we decide about X" → long-term memory (auto-injected) usually has it
 - "summarize this channel" → use slack with conversations_history / conversations_replies
 - "remember this" / "save this decision" → call add_memory
+- a message with attached files → their contents (images, text, or code) are
+  included with the message — read them directly and answer about them
 - greetings, thanks, small talk → reply conversationally, no tools
 
 Respond in Slack mrkdwn (*bold*, _italic_, `code`, • bullets, > quotes). Keep replies under 1500 chars when possible. Don't announce tool calls — use them and respond naturally."""
@@ -91,8 +114,22 @@ def _mcp_client() -> MCPClient | None:
     return MCPClient(lambda: stdio_client(StdioServerParameters(command=command, args=args)))
 
 
-def _build_agent() -> Agent:
-    """Build the agent. Caller is responsible for holding any MCP context."""
+def _system_prompt(app_name: str | None) -> str:
+    """Base persona, plus an optional per-app override from LOOP_PERSONA_<NAME>.
+
+    This is the seam for giving each Slack app its own behavior: set e.g.
+    LOOP_PERSONA_RASPUTIN="You are the on-call incident assistant ..." and only
+    the `rasputin` app's agent picks it up. Unset → the shared base persona.
+    """
+    if app_name:
+        persona = os.environ.get(f"LOOP_PERSONA_{app_name.upper()}")
+        if persona and persona.strip():
+            return f"{SYSTEM_PROMPT}\n\n## This app's specific role\n{persona.strip()}"
+    return SYSTEM_PROMPT
+
+
+def _build_agent(app_name: str | None = None) -> Agent:
+    """Build an agent for one app. Caller is responsible for holding any MCP context."""
     tools: list[Any] = [slack, slack_send_message, calculator, think]
 
     memory_manager = MemoryManager(
@@ -103,51 +140,187 @@ def _build_agent() -> Agent:
 
     return Agent(
         model=_build_model(),
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=_system_prompt(app_name),
         tools=tools,
         memory_manager=memory_manager,
+        hooks=[LoopTracer(), Guardrails()],
+        callback_handler=reasoning_callback,
     )
 
 
-def get_agent() -> Agent:
-    global _agent
-    if _agent is None:
-        _agent = _build_agent()
-        log.info("loop agent initialised")
-    return _agent
+def get_agent(app_name: str | None = None) -> Agent:
+    """Return the cached agent for `app_name` (one agent per Slack app)."""
+    key = app_name or "_default"
+    agent = _agents.get(key)
+    if agent is None:
+        agent = _build_agent(app_name)
+        _agents[key] = agent
+        log.info("loop agent initialised (app=%s)", key)
+    return agent
 
 
-def run(prompt: str) -> str:
-    """Invoke the agent and return the final assistant text.
+def run(
+    prompt: str,
+    *,
+    attachments: list[dict[str, Any]] | None = None,
+    context: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    app_name: str | None = None,
+) -> AgentRun:
+    """Invoke the agent and return its reply plus telemetry (`AgentRun`).
 
-    If an MCP client is registered, we enter its context manager so the
-    stdio connection is alive for the duration of the call (the documented
-    pattern from the Strands README). MCP-provided tools are added to the
-    agent's tool list inside that scope.
+    `context` is the Slack request envelope (user/channel/channel_type). When
+    present it is prepended as a small, clearly-marked context line so the agent
+    knows *who* is asking and *where* — e.g. enough for its slack tool to tag the
+    right user or read the right channel. This is the only "context" plumbing;
+    there is still no intent parser or router — the agent remains the only brain.
+
+    A `RequestState` is established for the call (using `request_id` if given, so
+    it lines up with the edge `Interaction`) and made the current context, so the
+    tracing + guardrail hooks can attribute steps and enforce per-request limits.
+
+    If an MCP client is registered, we enter its context manager so the stdio
+    connection is alive for the duration of the call (the documented pattern from
+    the Strands README), and MCP tools are added inside that scope.
     """
-    client = _mcp_client()
-    if client is None:
-        return _invoke(prompt)
+    message = _build_message(_with_context(prompt, context), attachments)
+    state = reqctx.RequestState(request_id=request_id) if request_id else reqctx.RequestState()
+    token = reqctx.set_current(state)
+    try:
+        client = _mcp_client()
+        if client is None:
+            return _result_to_run(get_agent(app_name)(message), state)
+        with client:
+            tools = list(get_agent(app_name).tool_registry.registry.values())
+            tools.extend(client.list_tools_sync())
+            agent = _build_agent(app_name)
+            agent.tool_registry.process_tools(tools)
+            return _result_to_run(agent(message), state)
+    finally:
+        reqctx.reset_current(token)
 
-    with client:
-        tools = list(get_agent().tool_registry.registry.values())
-        tools.extend(client.list_tools_sync())
-        agent = _build_agent()
-        agent.tool_registry.process_tools(tools)
-        return _extract_text(agent(prompt))
+
+def _with_context(prompt: str, context: dict[str, Any] | None) -> str:
+    if not context:
+        return prompt
+    bits: list[str] = []
+    if context.get("user"):
+        bits.append(f"from Slack user <@{context['user']}>")
+    if context.get("channel"):
+        bits.append(f"in channel <#{context['channel']}>")
+    if context.get("channel_type"):
+        bits.append(f"({context['channel_type']})")
+    if not bits:
+        return prompt
+    return f"[context] message {' '.join(bits)}\n\n{prompt}"
 
 
-def _invoke(prompt: str) -> str:
-    return _extract_text(get_agent()(prompt))
+# Slack mimetype → Strands image block format. Anything not listed (text/code/
+# json) is inlined as text by _build_message.
+_IMAGE_FORMATS = {
+    "image/png": "png",
+    "image/jpeg": "jpeg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+
+def _pdf_text(data: bytes) -> str:
+    """Extract text from a PDF. Lazy import of pypdf (lightweight, pure-Python)."""
+    try:
+        import io
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception:  # noqa: BLE001
+        log.exception("pdf text extraction failed")
+        return ""
+
+
+def _build_message(text: str, attachments: list[dict[str, Any]] | None) -> Any:
+    """Plain string when there are no files; otherwise a Strands multimodal
+    content list ``[{"text": …}, {"image": …}, …]``. Images go to the model
+    natively (MiniMax M3 is multimodal); text/code/json files are decoded and
+    inlined as text blocks. Anything that won't decode is skipped, not fatal."""
+    if not attachments:
+        return text
+    blocks: list[dict[str, Any]] = [{"text": text}]
+    for a in attachments:
+        mt, data, name = a.get("mimetype", ""), a.get("bytes", b""), a.get("name", "file")
+        fmt = _IMAGE_FORMATS.get(mt)
+        if fmt:
+            blocks.append({"image": {"format": fmt, "source": {"bytes": data}}})
+            continue
+        if mt == "application/pdf":
+            body = _pdf_text(data)
+            blocks.append({"text": f"\n--- attached PDF: {name} ---\n{body or '(no extractable text)'}"})
+            continue
+        try:
+            body = data.decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            log.info("attachment not decodable as text, skipped: %s (%s)", name, mt)
+            continue
+        blocks.append({"text": f"\n--- attached file: {name} ---\n{body}"})
+    return blocks
+
+
+def _result_to_run(result: Any, state: reqctx.RequestState | None = None) -> AgentRun:
+    """Pull text + metrics off a Strands AgentResult, folding in the per-request
+    counters the hooks accumulated (model calls, ordered tool calls, guardrail
+    hits, reasoning)."""
+    model_id = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    usage: dict[str, Any] = {}
+    tool_calls: list[str] = []
+    metrics = getattr(result, "metrics", None)
+    if metrics is not None:
+        acc = getattr(metrics, "accumulated_usage", None)
+        if isinstance(acc, dict):
+            usage = acc
+        tm = getattr(metrics, "tool_metrics", None)
+        if isinstance(tm, dict):
+            tool_calls = list(tm.keys())
+
+    # Prefer the tracer's ordered, repeat-aware tool list when available.
+    if state is not None and state.tool_calls:
+        tool_calls = state.tool_calls
+
+    return AgentRun(
+        text=_extract_text(result),
+        model_id=model_id,
+        input_tokens=int(usage.get("inputTokens", 0) or 0),
+        output_tokens=int(usage.get("outputTokens", 0) or 0),
+        total_tokens=int(usage.get("totalTokens", 0) or 0),
+        tool_calls=tool_calls,
+        model_calls=state.model_calls if state else 0,
+        guardrail_hits=state.guardrail_hits if state else 0,
+        reasoning="\n".join(state.reasoning).strip() if state else "",
+        stop_reason=getattr(result, "stop_reason", None),
+    )
 
 
 def _extract_text(result: Any) -> str:
+    """Final assistant text from a Strands AgentResult.
+
+    Strands' `message` is a dict (`{"content": [{"text": ...}]}`), so attribute
+    access (`block.text`) never matches — its own `__str__` is the canonical
+    extractor (handles text blocks, citations, structured output). We use that,
+    with a manual dict/attr parse as a defensive fallback.
+    """
+    try:
+        text = str(result).strip()
+        if text:
+            return text
+    except Exception:  # noqa: BLE001
+        pass
+
     msg = getattr(result, "message", None)
     if msg is None:
         return ""
+    content = msg.get("content", []) if isinstance(msg, dict) else getattr(msg, "content", []) or []
     parts: list[str] = []
-    for block in getattr(msg, "content", []) or []:
-        text = getattr(block, "text", None)
+    for block in content:
+        text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
         if text:
             parts.append(text)
     return "\n".join(parts).strip()

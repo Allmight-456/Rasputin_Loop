@@ -1,6 +1,6 @@
 [project]
 name = "loop"
-version = "0.2.0"
+version = "0.3.1"
 description = "Loop — a Slack-native AI agent built on Strands"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,10 +10,12 @@ dependencies = [
     "slack-bolt>=1.18.0",
     "slack-sdk>=3.27.0",
     "python-dotenv>=1.0.0",
+    "pypdf>=4.0.0",
 ]
 
 [project.scripts]
 loop = "loop.main:main"
+loop-eval = "loop.eval:main"
 
 [build-system]
 requires = ["hatchling"]

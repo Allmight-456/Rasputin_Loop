@@ -14,6 +14,7 @@ memories are just there.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -49,10 +50,15 @@ class SqliteMemoryStore:
             CREATE TABLE IF NOT EXISTS memory_entries (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 content    TEXT NOT NULL,
+                metadata   TEXT,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             )
             """
         )
+        # Idempotent migration for DBs created before `metadata` existed.
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(memory_entries)").fetchall()}
+        if "metadata" not in cols:
+            self._conn.execute("ALTER TABLE memory_entries ADD COLUMN metadata TEXT")
         self._conn.commit()
 
     async def search(self, query: str, options: SearchOptions | None = None) -> list[MemoryEntry]:
@@ -73,13 +79,18 @@ class SqliteMemoryStore:
         ]
 
     async def add(self, content: str, metadata: Any = None) -> int:
-        # `metadata` is accepted for Protocol conformance but currently unstored —
-        # we have no consumer for it and the agent doesn't surface it back.
-        del metadata
+        # Persist `metadata` (author, channel, team, ts, tags, …) as JSON so it
+        # is available for later per-team/user scoping and auditing — Pillar 03.
+        meta_json = None
+        if metadata is not None:
+            try:
+                meta_json = json.dumps(metadata, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                meta_json = json.dumps(str(metadata))
         with self._lock:
             cur = self._conn.execute(
-                "INSERT INTO memory_entries (content) VALUES (?)",
-                (content,),
+                "INSERT INTO memory_entries (content, metadata) VALUES (?, ?)",
+                (content, meta_json),
             )
             self._conn.commit()
             return int(cur.lastrowid or 0)

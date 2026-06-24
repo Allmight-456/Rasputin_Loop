@@ -12,15 +12,25 @@ venv/
 build/
 dist/
 
-# Strands agent state
-data/
-*.db
+# Strands agent state — KEEP the conversation DB, drop the transient SQLite sidecars
+data/*
+!data/loop.db
 *.db-shm
 *.db-wal
 
-# Env / secrets
+# Env / secrets (never commit real tokens)
 .env
 .env.local
+
+# Claude Code local config — not part of the project
+.claude/
+
+# Placeholder / scratch dirs
+slack_events/
+
+# Reference images (kept out of the repo)
+5_Pillars_of_production_AI.png
+Observability_study_ROI.png
 
 # OS
 .DS_Store

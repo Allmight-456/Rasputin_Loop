@@ -1,81 +1,175 @@
 # <img width="25" height="25" alt="loop" src="https://github.com/user-attachments/assets/20c20ad6-7a80-49eb-aa2e-5a0cf3cc1ac4" /> Loop
 
-A Slack-native AI agent built on [Strands Agents](https://strandsagents.com/).
+A Slack-native AI agent built on [Strands Agents](https://strandsagents.com/), running on **MiniMax M3** (via its Anthropic-compatible endpoint).
 
-When you `@Loop` mention the bot (or invoke `/loop`), the Strands agent thinks, optionally uses one of its tools, and replies in the thread. It remembers things via Strands' built-in long/short-term memory, and it talks to Slack via the official `slack` tool from `strands-agents-tools`.
+When you `@mention` the bot (or invoke `/loop`), a single Strands agent thinks, optionally uses a tool, and replies in the thread. It remembers things in long-term memory, reads files you attach, and can run as **several distinct Slack apps at once** from one process.
 
-## Tools available to the agent
+There is **one brain** — the agent. No intent parser, no command router, no extraction pipeline.
+
+---
+
+## Highlights
+
+| Capability | What it means |
+|---|---|
+| 🤖 **Strands agent** | One agent loop decides what to do; replies in Slack `mrkdwn`. |
+| 🧠 **Long-term memory** | Facts/decisions persisted in SQLite; relevant memories auto-injected before each reply. |
+| 👥 **Multi-app support** | Run **Loop _and_ Rasputin_Loop** (and more) in one process — each its own bot, its own agent, its own persona. |
+| 📎 **File & image reading** | Images go to the model natively (M3 is multimodal); text/code/JSON inlined; PDFs extracted (`pypdf`). |
+| 🛠️ **Tools** | `slack`, `slack_send_message`, `calculator`, `think`, plus runtime **MCP** tools. |
+| 🔭 **Observability** | Per-interaction telemetry + per-step traces, persisted to SQLite. |
+| 🛡️ **Guardrails** | Tool-call caps, repeat limits, token budget, and a risky-Slack-method blocklist. |
+| ✅ **Evaluation** | `loop-eval` runs a golden set through the real agent and gates on regressions. |
+
+See [`architecture.md`](architecture.md) for how it's wired and [`progress.md`](progress.md) for the roadmap (mapped to the 5 Pillars of Production AI).
+
+---
+
+## Multi-app support (Loop + Rasputin_Loop)
+
+Loop can run **one or many** Slack apps in a single process. Each configured app gets its own Bolt App, its own Socket Mode connection (own thread), and its own agent — but they share code, memory, and telemetry.
+
+- **One app (back-compat):** set the bare `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` (label it with `SLACK_APP_NAME`, default `loop`).
+- **Many apps:** add a `SLACK_BOT_TOKEN_<NAME>` + `SLACK_APP_TOKEN_<NAME>` pair per app.
+
+Give each app a different job with **`LOOP_PERSONA_<NAME>`**, which is appended to that app's system prompt:
+
+```bash
+LOOP_PERSONA_LOOP=You are the team's general assistant.
+LOOP_PERSONA_RASPUTIN=You are the on-call incident assistant; be terse and precise.
+```
+
+Telemetry tags every interaction `"<app>:<entrypoint>"` (e.g. `rasputin:app_mention`) so the apps stay distinguishable.
+
+---
+
+## Tools & privileges
 
 | Tool | Source | Purpose |
 |---|---|---|
-| `slack` | `strands_tools.slack` | Read/post messages, list users, look up channels — any Slack Web API method |
-| `slack_send_message` | `strands_tools.slack` | Convenience wrapper for posting a message |
-| `search_memory` | Strands `MemoryManager` | Long-term memory recall (auto-injected into context) |
-| `add_memory` | Strands `MemoryManager` | Write to long-term memory |
-| `calculator` | `strands_tools.calculator` | Math |
-| `think` | `strands_tools.think` | Structured reasoning |
+| `slack` | `strands_tools.slack` | Any Slack Web API method (read/post messages, list users, look up channels). |
+| `slack_send_message` | `strands_tools.slack` | Convenience wrapper for posting a message. |
+| `search_memory` / `add_memory` | Strands `MemoryManager` | Long-term memory recall (auto-injected) and writes. |
+| `calculator` | `strands_tools.calculator` | Math. |
+| `think` | `strands_tools.think` | Structured reasoning for hard problems. |
+| *(MCP tools)* | `LOOP_MCP_SERVERS` | Any stdio MCP server's tools, loaded at runtime. |
 
-That's it. No hand-rolled Slack helpers, no scoring heuristics, no extraction pipeline. The agent decides what to do.
+**Required Slack bot scopes:** `app_mentions:read`, `chat:write`, `commands`, `reactions:write`, `files:read`, `channels:history`, `groups:history`, `im:history`, `users:read`.
+
+---
 
 ## Setup
 
+### 1. Install
+
 ```bash
-# 1. Install
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
+```
 
-# 2. Configure
+### 2. Configure the Slack app(s)
+
+For **each** app at <https://api.slack.com/apps>:
+
+1. **OAuth & Permissions** → add the bot scopes above → **Install / Reinstall**, copy the **Bot User OAuth Token** (`xoxb-…`).
+2. **Basic Information → App-Level Tokens** → Generate one with `connections:write`, copy it (`xapp-…`).
+3. **Socket Mode** → **Enable** _(do this first — it removes the Request URL requirement on the next step)_.
+4. **Event Subscriptions** → Enable → **Subscribe to bot events**: `app_mention`, `message.im` → **Save Changes** → reinstall if prompted.
+5. Invite the bot to channels: `/invite @YourApp`.
+
+> If `@YourApp` never reacts: the socket connects but **Event Subscriptions / Socket Mode** aren't set for that app — that's the #1 silent-bot cause.
+
+### 3. Configure `.env`
+
+```bash
 cp .env.example .env
-# edit .env with your Slack + Anthropic credentials
+```
 
-# 3. Run
+```dotenv
+# ── Single app ──
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+SLACK_APP_NAME=loop
+
+# ── Or multiple apps ──
+SLACK_BOT_TOKEN_LOOP=xoxb-...
+SLACK_APP_TOKEN_LOOP=xapp-...
+SLACK_BOT_TOKEN_RASPUTIN=xoxb-...
+SLACK_APP_TOKEN_RASPUTIN=xapp-...
+
+# ── Model: MiniMax M3 via the Anthropic-compatible endpoint ──
+ANTHROPIC_API_KEY=                 # your MiniMax key (or ANTHROPIC_AUTH_TOKEN)
+ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic
+ANTHROPIC_MODEL=MiniMax-M3
+
+# ── Storage ──
+DATABASE_PATH=./data/loop.db
+```
+
+See [`.env.example`](.env.example) for every knob (personas, guardrails, observability, file-size cap, MCP).
+
+### 4. Run
+
+```bash
 loop
 ```
+```
+loop: Slack app 'rasputin' connected (socket mode)
+loop: Slack app 'loop' connected (socket mode)
+loop: 2 app(s) running: rasputin, loop
+```
 
-## Environment
+---
 
-| Var | Required | Purpose |
-|---|---|---|
-| `SLACK_BOT_TOKEN` | yes | Bot User OAuth Token (`xoxb-...`) |
-| `SLACK_APP_TOKEN` | yes (Socket Mode) | App-Level Token (`xapp-...`) |
-| `ANTHROPIC_API_KEY` | one of these | Standard Anthropic API key |
-| `ANTHROPIC_AUTH_TOKEN` | one of these | Proxy token (used when `ANTHROPIC_API_KEY` is unset) |
-| `ANTHROPIC_BASE_URL` | no | Override for proxies |
-| `ANTHROPIC_MODEL` | no | Defaults to `claude-sonnet-4-6` |
-| `DATABASE_PATH` | no | SQLite file path (default `./data/loop.db`) |
-| `LOG_LEVEL` | no | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+## Commands
 
-## Architecture
+| Command | What it does |
+|---|---|
+| `loop` | Start the agent and connect every configured Slack app. |
+| `loop-eval` | Run `evals/golden.json` through the real agent; scores tool selection + reply content; exits non-zero on regression. Flags: `--limit`, `--case`, `--json`. |
+
+---
+
+## Production harness
+
+Loop ships with the foundations for running an agent in production (see [`progress.md`](progress.md) for the full 5-Pillars roadmap):
+
+- **Observability** — every interaction emits a JSON telemetry line + an `interactions` row; every model call, tool call, and reasoning chunk emits a trace + a `steps` row. `LOG_LEVEL=DEBUG` shows full reasoning + tool I/O.
+- **Guardrails** — per-request circuit breakers (max tool calls, repeated calls, token budget) and a destructive-Slack-method blocklist, each toggled by env.
+- **Evaluation** — a golden set + `loop-eval` CI gate so a model/prompt swap can't silently regress quality.
+
+---
+
+## Database
+
+Local **SQLite** at `DATABASE_PATH` (default `./data/loop.db`), no external services. Tables: `memory_entries` (long-term memory), `interactions` (edge telemetry), `steps` (per-step traces), `eval_results` (eval runs). The committed `data/loop.db` carries the conversation/telemetry history.
+
+---
+
+## Project layout
 
 ```
-Slack @-mention  ──►  slack_bolt.App  ──►  loop.agent.run(prompt)
-                                                │
-                                                ▼
-                                       with MCPClient(...) (if LOOP_MCP_SERVERS set):
-                                                │
-                                                ▼
-                                       Strands Agent(AnthropicModel,
-                                                     system_prompt,
-                                                     tools=[slack, slack_send_message,
-                                                            calculator, think,
-                                                            search_memory, add_memory,
-                                                            *mcp_tools],
-                                                     memory_manager=MemoryManager(stores=[SqliteMemoryStore()]))
-                                                │
-                                                ▼
-                                       agent(prompt)  ──►  final response
-                                                │
-                                                ▼
-                                       slack_bolt "say" reply in thread
+loop/
+  main.py          # entrypoint — loads .env, starts the Slack app(s)
+  slack_app.py     # multi-app discovery + Socket Mode handlers, file download
+  agent.py         # builds one Strands agent per app (+ persona), runs it
+  storage.py       # SqliteMemoryStore (long-term memory)
+  context.py       # per-request state (ContextVar) for hooks
+  tracing.py       # step traces (LoopTracer) + reasoning callback
+  guardrails.py    # tool-call circuit breakers
+  observability.py # interaction/step/eval telemetry + SQLite tables
+  eval.py          # `loop-eval` runner
+evals/golden.json  # golden eval set
+architecture.md    # how it's wired (source of truth)
+progress.md        # status + 5-Pillars roadmap
 ```
+
+---
 
 ## Adding MCP tools at runtime
-
-Set `LOOP_MCP_SERVERS` to a stdio command (and any args). The agent enters the
-MCP context for each invocation, loads the server's tools, and exposes them
-alongside the built-in ones. Drop a new server in with no code changes:
 
 ```bash
 LOOP_MCP_SERVERS="uvx strands-agents-mcp-server" loop
 ```
+The agent enters the MCP context per invocation, loads that server's tools, and exposes them alongside the built-ins — no code changes.
