@@ -245,6 +245,12 @@ class SqliteMemoryStore:
         meta_json = json.dumps(merged, ensure_ascii=False, default=str) if merged else None
 
         with self._lock:
+            dup = self._conn.execute(
+                "SELECT id FROM memory_entries WHERE content = ? LIMIT 1", (content,)
+            ).fetchone()
+            if dup:
+                log.info("memory dedup: identical content already stored id=%s", dup[0])
+                return int(dup[0])
             cur = self._conn.execute(
                 """
                 INSERT INTO memory_entries

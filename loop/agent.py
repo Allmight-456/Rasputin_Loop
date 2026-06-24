@@ -103,6 +103,8 @@ Memory discipline — you are the filter, so save signal, not noise:
   sentence summary of what was decided/learned, not the raw transcript).
 - DON'T save: greetings, thanks, chit-chat, one-off lookups, or anything already
   obvious. When in doubt, prefer NOT saving — a noisy memory hurts recall.
+- When you're only ANSWERING a recall/lookup question (the fact is already in the
+  injected <memory>), just answer — do NOT call add_memory to re-save it.
 - Write each memory as a self-contained statement (who/what, and any specifics)
   so it still makes sense months later. Provenance — who said it, the channel,
   and the date — is attached automatically; you don't need to add it yourself.

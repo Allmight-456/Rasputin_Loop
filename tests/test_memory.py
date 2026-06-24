@@ -83,6 +83,15 @@ def test_like_fallback_when_fts_disabled() -> None:
     assert hits and "runbook" in hits[0].content
 
 
+def test_exact_content_dedup() -> None:
+    store = _store()
+    id1 = asyncio.run(store.add("Deploy window is Fridays 3-5pm."))
+    id2 = asyncio.run(store.add("Deploy window is Fridays 3-5pm."))  # identical
+    assert id1 == id2, "identical content should not create a second row"
+    n = store._conn.execute("SELECT count(*) FROM memory_entries").fetchone()[0]
+    assert n == 1, f"expected 1 row, found {n}"
+
+
 def test_injection_format_surfaces_provenance() -> None:
     store = _store()
     state = reqctx.RequestState()
