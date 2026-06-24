@@ -246,6 +246,8 @@ def _ctx(event: dict) -> dict:
         "user": event.get("user"),
         "channel": event.get("channel"),
         "channel_type": event.get("channel_type"),
+        "team": event.get("team"),
+        "thread_ts": event.get("thread_ts") or event.get("ts"),
     }
 
 
@@ -254,6 +256,7 @@ def _ctx_cmd(command: dict) -> dict:
         "user": command.get("user_id"),
         "channel": command.get("channel_id"),
         "channel_type": "slash",
+        "team": command.get("team_id"),
     }
 
 

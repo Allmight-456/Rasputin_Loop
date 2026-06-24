@@ -13,7 +13,7 @@ There is **one brain** — the agent. No intent parser, no command router, no ex
 | Capability | What it means |
 |---|---|
 | 🤖 **Strands agent** | One agent loop decides what to do; replies in Slack `mrkdwn`. |
-| 🧠 **Long-term memory** | Facts/decisions persisted in SQLite; relevant memories auto-injected before each reply. |
+| 🧠 **Episodic memory** | Crucial facts/decisions/episodes persisted in SQLite, each **stamped with who/where/when**; recalled by **FTS5** full-text search and auto-injected (with provenance) before each reply. The agent is the filter — it saves signal, skips chit-chat. |
 | 👥 **Multi-app support** | Run **Loop _and_ Rasputin_Loop** (and more) in one process — each its own bot, its own agent, its own persona. |
 | 📎 **File & image reading** | Images go to the model natively (M3 is multimodal); text/code/JSON inlined; PDFs extracted (`pypdf`). |
 | 🛠️ **Tools** | `slack`, `slack_send_message`, `calculator`, `think`, plus runtime **MCP** tools. |
@@ -143,7 +143,9 @@ Loop ships with the foundations for running an agent in production (see [`progre
 
 ## Database
 
-Local **SQLite** at `DATABASE_PATH` (default `./data/loop.db`), no external services. Tables: `memory_entries` (long-term memory), `interactions` (edge telemetry), `steps` (per-step traces), `eval_results` (eval runs). The committed `data/loop.db` carries the conversation/telemetry history.
+Local **SQLite** at `DATABASE_PATH` (default `./data/loop.db`), no external services. Tables: `memory_entries` (long-term memory — provenance columns `author/channel/team/source/thread_ts/kind` + `metadata` JSON), `memory_fts` (FTS5 mirror for ranked recall), `interactions` (edge telemetry), `steps` (per-step traces), `eval_results` (eval runs). The committed `data/loop.db` carries the conversation/telemetry history.
+
+Memory is **episodic and provenance-stamped**: the `add_memory` tool only carries content, so the store auto-attaches *who said it, in which channel/workspace, via which app, and when* (from the request) — recall can then say "_per @alice in #infra on 2026-06-20_". Search is **FTS5** (`bm25()` + recency) with a sanitized, injection-safe query and a `LIKE` fallback. Run the storage tests with `python -m tests.test_memory` (no pytest/key needed).
 
 ---
 
@@ -154,13 +156,14 @@ loop/
   main.py          # entrypoint — loads .env, starts the Slack app(s)
   slack_app.py     # multi-app discovery + Socket Mode handlers, file download
   agent.py         # builds one Strands agent per app (+ persona), runs it
-  storage.py       # SqliteMemoryStore (long-term memory)
+  storage.py       # SqliteMemoryStore — episodic, provenance-stamped, FTS5 recall
   context.py       # per-request state (ContextVar) for hooks
   tracing.py       # step traces (LoopTracer) + reasoning callback
   guardrails.py    # tool-call circuit breakers
   observability.py # interaction/step/eval telemetry + SQLite tables
   eval.py          # `loop-eval` runner
 evals/golden.json  # golden eval set
+tests/test_memory.py # storage-layer tests (no pytest/key needed)
 architecture.md    # how it's wired (source of truth)
 progress.md        # status + 5-Pillars roadmap
 ```

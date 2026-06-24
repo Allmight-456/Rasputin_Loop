@@ -50,12 +50,19 @@ chunk + a `steps` row. `LOG_LEVEL=DEBUG` shows full thinking + tool I/O.
 - [ ] Export traces to an OTLP backend (Phoenix/Langfuse); build a dashboard.
 - [ ] Alert on error-rate / latency / quality drift.
 
-### 03 — Data Foundation · _Question + Tracking data_  — ⚠️ improving
-`interactions` + `steps` + `eval_results` tables now exist (the substrate for 01/02),
-and memory `metadata` is persisted instead of dropped.
+### 03 — Data Foundation · _Question + Tracking data_  — ✅ much improved
+`interactions` + `steps` + `eval_results` tables exist (substrate for 01/02), and
+memory is now **episodic + provenance-stamped + full-text searchable**.
 - [x] Stop dropping `metadata`; add the interaction/step event log.
-- [ ] Scope memory by team/channel/user (metadata stored, but `search()` ignores it).
-- [ ] Upgrade retrieval: SQLite **FTS5**, then optionally embeddings/semantic.
+- [x] **Provenance on every memory** — author/channel/team/source/thread_ts/date
+  auto-stamped from the request (the `add_memory` tool can't carry metadata, so
+  the store attaches it); surfaced back to the model via a custom injection format.
+- [x] **FTS5 retrieval** — BM25 + recency, sanitized query, `LIKE` fallback.
+      No new deps, no API key. Tested in `tests/test_memory.py`.
+- [ ] Per-scope **filtering** in `search()` (columns + metadata are there; ranking
+      is still global).
+- [ ] **Semantic retrieval** — libSQL/Turso vector backend + pluggable embeddings
+      on `feat/vector-memory-turso` (experimental; off `main` until verifiable).
 
 ### 04 — Orchestration · _Patterns that scale_  — ⚠️ improving
 Guardrails add runaway-loop, repeat, and token-budget circuit breakers. Still
@@ -106,6 +113,25 @@ prompt edit could silently regress quality and we'd never know.
 ---
 
 ## Status log
+- **2026-06-24 (later)** — **Episodic memory overhaul (Pillar 03), shipped to
+  `main` — no new deps, no API key.** `SqliteMemoryStore` now: (1) **stamps
+  provenance** on every memory (author/channel/team/source/thread_ts/date) pulled
+  from `RequestState` — the `add_memory` tool only carries content, so the store
+  attaches who/where/when itself; (2) recalls via **FTS5** (`bm25()` + recency)
+  with a sanitized prefix-OR query (`_fts_match`, injection-safe) and a `LIKE`
+  fallback if the SQLite build lacks FTS5; (3) surfaces provenance back to the
+  model through a custom Strands **injection format** (`agent._format_memories`)
+  that tags each `<entry>` with `from/in/when` (the default format drops
+  metadata). System prompt gained **memory discipline** (save decisions/facts/
+  prefs/episodes; skip chit-chat — the agent is the filter). Added
+  `tests/test_memory.py` (6 cases, all green; runnable without pytest). Migration
+  is additive + idempotent; verified against a copy of the committed `loop.db`
+  (existing row re-indexed, recall works across wording). **Experimental, on
+  branches (not merged):** `feat/vector-memory-turso` (libSQL/Turso native vector
+  search + pluggable embeddings — fastembed default = no key) and
+  `feat/slack-assistant` (native Slack "Assistant" AI surface). Hackathon: Loop
+  qualifies today via **MCP server integration** (`LOOP_MCP_SERVERS`); the
+  Assistant branch adds a clean **Slack AI capabilities** claim.
 - **2026-06-24 (pm)** — **Multi-app support.** `slack_app._discover_apps()` +
   `start()` now run N Slack apps in one process (each its own Bolt App + Socket
   Mode thread), via `SLACK_BOT_TOKEN_<NAME>`/`SLACK_APP_TOKEN_<NAME>` pairs (bare

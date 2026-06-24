@@ -23,6 +23,16 @@ from dataclasses import dataclass, field
 class RequestState:
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
+    # provenance of the originating Slack message (who / where / which app).
+    # Set by agent.run() from the Slack envelope so the memory store can stamp
+    # every saved memory with who provided it and where — the `add_memory` tool
+    # only lets the model pass content, so provenance must be attached here.
+    author: str | None = None       # Slack user id of the asker
+    channel: str | None = None      # Slack channel id
+    team: str | None = None         # Slack team/workspace id
+    source: str | None = None       # which Loop app handled it (e.g. "rasputin")
+    thread_ts: str | None = None    # thread the message belongs to
+
     # counters / accumulators, mutated by the tracing + guardrail hooks
     model_calls: int = 0
     tool_calls: list[str] = field(default_factory=list)   # ordered tool names (incl. repeats/blocked attempts)
@@ -39,6 +49,17 @@ class RequestState:
         with self.lock:
             self._seq += 1
             return self._seq
+
+    def provenance(self) -> dict[str, str]:
+        """The non-empty provenance fields, as a flat dict for memory metadata."""
+        fields = {
+            "author": self.author,
+            "channel": self.channel,
+            "team": self.team,
+            "source": self.source,
+            "thread_ts": self.thread_ts,
+        }
+        return {k: v for k, v in fields.items() if v}
 
 
 _CURRENT: contextvars.ContextVar[RequestState | None] = contextvars.ContextVar(

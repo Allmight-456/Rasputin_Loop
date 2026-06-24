@@ -61,7 +61,7 @@ final text → Slack thread;  one JSON telemetry line + interactions row recorde
 | `loop/guardrails.py` | `Guardrails` (`HookProvider`): enforcing tool-call limits via `cancel_tool`, with per-rule env toggles. |
 | `loop/observability.py` | `Interaction` + `record()` (edge telemetry), `record_step()`, `record_eval()`; owns the `interactions` / `steps` / `eval_results` tables. |
 | `loop/eval.py` | `loop-eval` CLI: runs `evals/golden.json` through the real agent and scores tool selection + reply expectations. |
-| `loop/storage.py` | `SqliteMemoryStore` — implements the Strands `MemoryStore` protocol over local SQLite; now persists `metadata`. |
+| `loop/storage.py` | `SqliteMemoryStore` — implements the Strands `MemoryStore` protocol over local SQLite. **Episodic + provenance-stamped:** every memory is auto-tagged with who/where/when (from `RequestState`) into dedicated columns; recall is **FTS5** (BM25 + recency) with a sanitized query and a `LIKE` fallback. |
 | `loop/__init__.py` | Version marker (`0.3.1`). |
 
 ## Model provider
@@ -89,13 +89,18 @@ handler threads (`check_same_thread=False`).
 **Schema (tables):**
 
 ```sql
--- long-term memory (loop/storage.py)
+-- long-term memory (loop/storage.py) — episodic + provenance-stamped
 CREATE TABLE memory_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content TEXT NOT NULL,
-    metadata TEXT,                      -- now persisted (JSON), no longer dropped
+    metadata TEXT,                      -- full provenance dict (JSON)
+    kind TEXT, author TEXT, channel TEXT, team TEXT, source TEXT, thread_ts TEXT,
+                                        -- who/where/which-app, promoted to columns for scoping
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
+-- FTS5 mirror for ranked recall; kept in sync by an AFTER INSERT trigger.
+CREATE VIRTUAL TABLE memory_fts USING fts5(
+    content, content='memory_entries', content_rowid='id');
 
 -- telemetry / data foundation (loop/observability.py)
 CREATE TABLE interactions (             -- one row per Slack interaction (edge)
@@ -112,18 +117,29 @@ All telemetry tables are opened on a separate connection from the memory store
 (WAL makes concurrent access safe) and created/migrated lazily on first write.
 
 **How memory is used:**
-- `SqliteMemoryStore.add(content, metadata)` — INSERTs `content` **and** `metadata`
-  (JSON). Substrate for future per-team/user scoping + auditing.
-- `SqliteMemoryStore.search(query)` — naive `LIKE '%query%'` substring match,
-  newest first, capped at `max_search_results` (5). Strands auto-injects matches
-  into the agent's context before each model call, so recall is passive.
-- `writable=True`, `extraction=False` — the agent decides what to persist via
-  the `add_memory` tool; nothing is auto-extracted.
+- `SqliteMemoryStore.add(content, metadata)` — auto-stamps provenance from the
+  active `RequestState` (author/channel/team/source/thread_ts) into columns +
+  the JSON blob, then INSERTs. The `add_memory` *tool* only lets the model pass
+  content, so this is **where who/where/when gets attached** — the agent never
+  has to (and can't) supply it.
+- `SqliteMemoryStore.search(query)` — FTS5 `MATCH` ranked by `bm25()` then
+  recency, capped at `max_search_results` (5). The query is reduced to safe
+  prefix-OR tokens (`_fts_match`) — stopwords dropped, no FTS5 syntax injection;
+  empty → `LIKE` fallback. Returns `MemoryEntry` carrying the provenance metadata.
+- **Injection format** (`agent._format_memories`) — recalled memories are
+  injected before each model call as a `<memory>` block where each `<entry>`
+  carries `from="@user" in="#channel" when="date"`, so the model can weigh and
+  cite provenance. (The Strands default format drops metadata; this restores it.)
+- `writable=True`, `extraction=False` — the agent is the filter: it decides what
+  is worth persisting via `add_memory` (system prompt steers it to save
+  decisions/facts/preferences/episodes, skip chit-chat); nothing is auto-extracted.
 
 **Remaining data-layer gaps (see `progress.md` Pillar 3):**
-- Memory is still **global** — no per-user / per-channel / per-team scoping
-  (metadata is now stored, but `search()` doesn't filter on it yet).
-- Retrieval is substring `LIKE`, not full-text (FTS5) or semantic (embeddings).
+- Recall is lexical (FTS5), not yet **semantic**. The optional libSQL/Turso
+  vector backend (pluggable embeddings) lives on the `feat/vector-memory-turso`
+  branch — kept off `main` until it can be verified end-to-end.
+- Scoping columns (channel/team/user) are stored and returned but `search()`
+  ranks globally; per-scope filtering is a small follow-up.
 
 ## Extensibility — MCP tools at runtime
 

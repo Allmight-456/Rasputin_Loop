@@ -25,7 +25,7 @@ from typing import Any
 
 from mcp import StdioServerParameters, stdio_client
 from strands import Agent
-from strands.memory import MemoryManager
+from strands.memory import InjectionFormatContext, MemoryInjectionConfig, MemoryManager
 from strands.models.anthropic import AnthropicModel
 from strands.tools.mcp import MCPClient
 from strands_tools import calculator, slack, think
@@ -96,6 +96,19 @@ When the user asks a question:
   included with the message — read them directly and answer about them
 - greetings, thanks, small talk → reply conversationally, no tools
 
+Memory discipline — you are the filter, so save signal, not noise:
+- DO save with add_memory: decisions ("we're going with X"), durable facts
+  (schedules, owners, links, config), team/user preferences, commitments, and
+  the distilled outcome of an important discussion (an "episode": a one-to-three
+  sentence summary of what was decided/learned, not the raw transcript).
+- DON'T save: greetings, thanks, chit-chat, one-off lookups, or anything already
+  obvious. When in doubt, prefer NOT saving — a noisy memory hurts recall.
+- Write each memory as a self-contained statement (who/what, and any specifics)
+  so it still makes sense months later. Provenance — who said it, the channel,
+  and the date — is attached automatically; you don't need to add it yourself.
+- Injected memories arrive in a <memory> block tagged with that provenance; cite
+  it when it matters ("per @alice on 2026-06-20 …").
+
 Respond in Slack mrkdwn (*bold*, _italic_, `code`, • bullets, > quotes). Keep replies under 1500 chars when possible. Don't announce tool calls — use them and respond naturally."""
 
 
@@ -128,6 +141,30 @@ def _system_prompt(app_name: str | None) -> str:
     return SYSTEM_PROMPT
 
 
+def _xml_escape(value: Any) -> str:
+    s = "" if value is None else str(value)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _format_memories(ctx: InjectionFormatContext) -> str:
+    """Render recalled memories with their provenance so the model can weigh and
+    cite them. The default Strands format drops entry metadata; we surface who
+    said it, where, and when as attributes on each <entry>."""
+    lines: list[str] = []
+    for e in ctx.entries:
+        meta = e.metadata or {}
+        attrs = ""
+        if meta.get("author"):
+            attrs += f' from="@{_xml_escape(meta["author"])}"'
+        if meta.get("channel"):
+            attrs += f' in="#{_xml_escape(meta["channel"])}"'
+        if meta.get("date"):
+            attrs += f' when="{_xml_escape(meta["date"])}"'
+        lines.append(f"<entry{attrs}>{_xml_escape(e.content)}</entry>")
+    body = "\n".join(lines)
+    return f"<memory>\n{body}\n</memory>" if body else ""
+
+
 def _build_agent(app_name: str | None = None) -> Agent:
     """Build an agent for one app. Caller is responsible for holding any MCP context."""
     tools: list[Any] = [slack, slack_send_message, calculator, think]
@@ -136,6 +173,7 @@ def _build_agent(app_name: str | None = None) -> Agent:
         stores=[SqliteMemoryStore()],
         search_tool_config=True,
         add_tool_config=True,
+        injection=MemoryInjectionConfig(format=_format_memories),
     )
 
     return Agent(
@@ -185,6 +223,7 @@ def run(
     """
     message = _build_message(_with_context(prompt, context), attachments)
     state = reqctx.RequestState(request_id=request_id) if request_id else reqctx.RequestState()
+    _apply_provenance(state, context, app_name)
     token = reqctx.set_current(state)
     try:
         client = _mcp_client()
@@ -198,6 +237,16 @@ def run(
             return _result_to_run(agent(message), state)
     finally:
         reqctx.reset_current(token)
+
+
+def _apply_provenance(state: reqctx.RequestState, context: dict[str, Any] | None, app_name: str | None) -> None:
+    """Stamp the request with who/where so memories saved during it carry it."""
+    ctx = context or {}
+    state.author = ctx.get("user")
+    state.channel = ctx.get("channel")
+    state.team = ctx.get("team")
+    state.thread_ts = ctx.get("thread_ts")
+    state.source = app_name
 
 
 def _with_context(prompt: str, context: dict[str, Any] | None) -> str:
