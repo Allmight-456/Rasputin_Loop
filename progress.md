@@ -38,7 +38,13 @@ tool selection + reply content (must/must-not contain), prints a scorecard, and
 exits non-zero on regression. Results persist to `eval_results`.
 - [x] Golden set with per-case expectations (tools + content), per-category scoring.
 - [x] CLI runner with CI exit code (`loop-eval`, `--limit`, `--case`, `--json`).
-- [ ] Wire `loop-eval` into CI; expand to ~30 cases; add groundedness + cost metrics.
+- [x] **Memory evals (25 cases):** provenance recall (answer derivable only from
+      who/where metadata → `mem-recall-provenance-who`), semantic recall across
+      wording (`mem-recall-semantic`, no shared tokens), selective save vs skip
+      chit-chat, and recall correctness. `loop-eval` now **isolates memory** to a
+      throwaway DB per run (eval_results still persist) so cases are deterministic
+      and don't pollute production memory. New memory cases verified 7/7 live.
+- [ ] Wire `loop-eval` into CI; add groundedness + cost metrics.
 - [ ] Run Claude vs MiniMax M3 to quantify the migration.
 
 ### 02 — Observability · _See everything, always_  — ✅ in place (v0.3.0)
@@ -133,8 +139,13 @@ prompt edit could silently regress quality and we'd never know.
   suggested prompts + "is thinking…" status, routed to the same agent; both apps
   connected live and attached the assistant cleanly. `.env` set to
   `hybrid`+`fastembed`+assistant-on; `pip install -e ".[vector]"`. Bumped to
-  v0.4.0. **Open:** human round-trip in the Rasputin_Loop assistant *pane*
-  (needs the Agents&AI-Apps feature + assistant_thread_* events subscribed).
+  v0.4.0. Added **7 memory evals** (provenance recall, semantic recall across
+  wording, selective save vs skip-chit-chat); `loop-eval` now isolates memory to a
+  throwaway DB per run via `LOOP_MEMORY_DB_PATH`/`LOOP_VECTOR_DB_PATH` (eval_results
+  still persist) — new cases 7/7 green live. Note: MiniMax M3 sometimes re-saves a
+  re-phrased fact on a recall turn (exact dups deduped; not asserted in CI).
+  **Open:** human round-trip in the Rasputin_Loop assistant *pane* (needs the
+  Agents&AI-Apps feature + assistant_thread_* events subscribed).
 - **2026-06-24 (later)** — **Episodic memory overhaul (Pillar 03), shipped to
   `main` — no new deps, no API key.** `SqliteMemoryStore` now: (1) **stamps
   provenance** on every memory (author/channel/team/source/thread_ts/date) pulled

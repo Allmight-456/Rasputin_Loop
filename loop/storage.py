@@ -92,7 +92,14 @@ class SqliteMemoryStore:
     extraction = False  # the agent decides what is worth remembering via add_memory
 
     def __init__(self, db_path: str | None = None) -> None:
-        self.db_path = db_path or os.environ.get("DATABASE_PATH", DEFAULT_DB_PATH)
+        # Memory can live in its own file (LOOP_MEMORY_DB_PATH); otherwise it
+        # shares DATABASE_PATH with telemetry. The split lets `loop-eval` point
+        # memory at a throwaway DB while still persisting eval_results to the real one.
+        self.db_path = (
+            db_path
+            or os.environ.get("LOOP_MEMORY_DB_PATH")
+            or os.environ.get("DATABASE_PATH", DEFAULT_DB_PATH)
+        )
         _ensure_parent(self.db_path)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)

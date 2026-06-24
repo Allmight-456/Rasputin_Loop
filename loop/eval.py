@@ -7,11 +7,18 @@ and that no guardrail crash occurred. Prints a scorecard (overall + per-category
 pass rate, tool-selection accuracy) and exits non-zero on any failure so it can
 gate CI. Results are also persisted to the `eval_results` table for trend tracking.
 
+Memory is isolated to a throwaway DB by default so add/recall cases get a clean,
+deterministic store and never pollute production memory (eval_results still
+persist to the real DATABASE_PATH). Memory-dependent cases (mem-add-* before
+mem-recall-*) rely on file order within a single run. Pass --use-real-memory to
+run against the live store instead.
+
 Usage:
     loop-eval                 # run the whole golden set
     loop-eval --limit 5       # first 5 cases (smoke test)
     loop-eval --case calc-multiply mem-recall-standup
     loop-eval --json          # machine-readable summary to stdout
+    loop-eval --use-real-memory   # don't isolate memory (default: throwaway DB)
 
 Each case in golden.json:
     { "id", "category", "prompt", "context?": {user, channel, channel_type},
@@ -69,9 +76,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="run only the first N cases")
     parser.add_argument("--case", nargs="+", default=None, help="run only these case ids")
     parser.add_argument("--json", action="store_true", help="emit a JSON summary")
+    parser.add_argument(
+        "--use-real-memory", action="store_true",
+        help="run against the real memory DB instead of a throwaway one (default: isolate)",
+    )
     args = parser.parse_args(argv)
 
-    # Import after load_dotenv so the model env is in place.
+    # Isolate memory by default so eval add/recall cases get a clean, deterministic
+    # store and never pollute production memory. eval_results still go to the real
+    # DATABASE_PATH (telemetry is decoupled from memory). Memory-dependent cases
+    # (mem-add-* before mem-recall-*) rely on file order within one run.
+    if not args.use_real_memory:
+        import tempfile
+
+        mem_dir = tempfile.mkdtemp(prefix="loop-eval-mem-")
+        os.environ["LOOP_MEMORY_DB_PATH"] = os.path.join(mem_dir, "memory.db")
+        os.environ["LOOP_VECTOR_DB_PATH"] = os.path.join(mem_dir, "memory_vec.db")
+
+    # Import after load_dotenv (+ memory env) so the model/store env is in place.
     from loop import observability as obs
     from loop.agent import run as run_agent
 

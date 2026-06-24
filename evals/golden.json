@@ -110,5 +110,50 @@
     "category": "memory",
     "prompt": "remember that we prefer concise, bullet-point summaries in this workspace.",
     "expect": { "must_use_tools": ["add_memory"] }
+  },
+  {
+    "id": "mem-skip-chitchat",
+    "category": "memory",
+    "prompt": "ugh, mondays... hope everyone survived the weekend 😅",
+    "expect": { "must_not_use_tools": ["add_memory", "calculator"], "must_not_contain": ["Traceback"] }
+  },
+  {
+    "id": "mem-add-deploywindow",
+    "category": "memory",
+    "prompt": "remember: our deploy window is Fridays from 3 to 5pm.",
+    "context": { "user": "U_QUOKKA", "channel": "C_BUILDS", "channel_type": "channel" },
+    "expect": { "must_use_tools": ["add_memory"] }
+  },
+  {
+    "id": "mem-recall-deploywindow",
+    "category": "memory",
+    "prompt": "when is our deploy window?",
+    "expect": { "must_contain": ["friday"], "must_not_contain": ["Traceback"] }
+  },
+  {
+    "id": "mem-add-buildbreak",
+    "category": "memory",
+    "prompt": "log this for the team: the staging build is broken right now.",
+    "context": { "user": "U_QUOKKA", "channel": "C_BUILDS", "channel_type": "channel" },
+    "expect": { "must_use_tools": ["add_memory"] }
+  },
+  {
+    "id": "mem-recall-provenance-who",
+    "category": "memory",
+    "prompt": "who reported that the staging build is broken?",
+    "expect": { "must_contain": ["quokka"], "must_not_contain": ["Traceback"] }
+  },
+  {
+    "id": "mem-add-playbook",
+    "category": "memory",
+    "prompt": "please remember: the on-call incident playbook lives in Notion under the SRE space.",
+    "context": { "user": "U_QUOKKA", "channel": "C_SRE", "channel_type": "channel" },
+    "expect": { "must_use_tools": ["add_memory"] }
+  },
+  {
+    "id": "mem-recall-semantic",
+    "category": "memory",
+    "prompt": "where do we keep the runbook for handling outages?",
+    "expect": { "must_contain": ["notion"], "must_not_contain": ["Traceback"] }
   }
 ]
