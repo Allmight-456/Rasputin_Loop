@@ -1,26 +1,29 @@
-"""libSQL / Turso vector-backed MemoryStore — semantic recall.
+"""Hybrid (lexical + semantic) MemoryStore over libSQL / Turso — Agentic RAG.
 
-EXPERIMENTAL — lives on the `feat/vector-memory-turso` branch, not on `main`.
+Recall fuses two retrievers over one libSQL/Turso database:
 
-Why libSQL/Turso: it is SQLite-compatible (so the schema, provenance columns, and
-mental model are identical to `loop.storage.SqliteMemoryStore`) but adds **native
-vector search** — `F32_BLOB(n)` columns, `vector32()`, an ANN index via
-`libsql_vector_idx`, and the `vector_top_k()` table function. Same single local
-file as today (no server); optionally syncable to Turso cloud / embedded replicas
-later by passing `sync_url` + `auth_token` to `libsql.connect`.
+  • **Lexical** — FTS5 `MATCH` ranked by BM25 (exact words, names, ids, numbers).
+  • **Semantic** — native vector search (`F32_BLOB` + `libsql_vector_idx` +
+    `vector_top_k`) over text embeddings (meaning, paraphrase, synonyms).
 
-This swaps lexical FTS5 recall for semantic recall: "where do we keep the deploy
-runbook" can find "the on-call playbook lives in Notion" even with zero shared
-words, because both map to nearby embedding vectors.
+…then merges them with **Reciprocal Rank Fusion (RRF)** so a memory that ranks
+well on *either* signal surfaces, and one that ranks well on *both* wins. This is
+the standard hybrid-RAG retrieval pattern and beats either signal alone.
 
-Enable (on the branch):
-    pip install "loop[vector]"          # libsql-experimental + fastembed
-    LOOP_MEMORY_BACKEND=libsql
-    LOOP_EMBEDDINGS=fastembed           # default; no API key. See loop/embeddings.py
+Why libSQL/Turso: it *is* SQLite, so the content, provenance columns, FTS5 index,
+and vectors all live in one local file (no server), queried transactionally, and
+can later sync to Turso cloud. It stores/searches vectors but does **not** create
+them — embeddings come from `loop.embeddings` (default `fastembed`, local, no API
+key; `minimax`/`openai` optional).
 
-Drop-in: it implements the same Strands `MemoryStore` protocol, stamps the same
-provenance (from `RequestState`), and returns `MemoryEntry` with provenance
-metadata — so the agent and the injection format are unchanged.
+Same Strands `MemoryStore` contract, same provenance stamping, and same
+`MemoryEntry` shape as the FTS5-only store on `main`, so the agent, injection
+format, and tools are unchanged — only recall quality differs.
+
+Enable:
+    pip install "loop[vector]"
+    LOOP_MEMORY_BACKEND=hybrid          # (libsql/turso/vector are aliases)
+    LOOP_EMBEDDINGS=fastembed           # local, no key. See loop/embeddings.py
 """
 from __future__ import annotations
 
@@ -36,11 +39,13 @@ from strands.memory.types import MemoryEntry, SearchOptions
 
 from loop import context as reqctx
 from loop.embeddings import Embedder, get_embedder
+from loop.storage import _fts_match  # reuse the injection-safe query sanitizer
 
 log = logging.getLogger("loop.vector")
 
 DEFAULT_VECTOR_DB_PATH = "./data/loop_vec.db"
 _PROVENANCE_COLS = ("kind", "author", "channel", "team", "source", "thread_ts")
+_RRF_K = 60  # Reciprocal Rank Fusion damping constant (standard default)
 
 
 def _vector_literal(vec: list[float]) -> str:
@@ -48,13 +53,13 @@ def _vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
-class LibsqlVectorMemoryStore:
-    """Semantic long-term memory over libSQL/Turso native vector search."""
+class HybridMemoryStore:
+    """Hybrid lexical+semantic long-term memory over libSQL/Turso."""
 
     name = "loop_memory"
     description = (
-        "Loop's semantic memory of crucial facts, decisions, preferences, and "
-        "episodes — each stamped with who said it, where, and when."
+        "Loop's hybrid (full-text + semantic) memory of crucial facts, decisions, "
+        "preferences, and episodes — each stamped with who said it, where, and when."
     )
     max_search_results = 5
     writable = True
@@ -63,10 +68,10 @@ class LibsqlVectorMemoryStore:
     def __init__(self, db_path: str | None = None, embedder: Embedder | None = None) -> None:
         try:
             import libsql_experimental as libsql  # noqa: PLC0415 (optional dep)
-        except ImportError as err:  # pragma: no cover - exercised only without the dep
+        except ImportError as err:  # pragma: no cover
             raise RuntimeError(
                 'libSQL not installed. Run: pip install "loop[vector]" '
-                "(or set LOOP_MEMORY_BACKEND=sqlite to use the FTS5 store)."
+                "(or set LOOP_MEMORY_BACKEND=sqlite for the FTS5-only store)."
             ) from err
 
         self.db_path = db_path or os.environ.get("LOOP_VECTOR_DB_PATH", DEFAULT_VECTOR_DB_PATH)
@@ -99,22 +104,81 @@ class LibsqlVectorMemoryStore:
             "CREATE INDEX IF NOT EXISTS memory_vec_idx "
             "ON memory_entries(libsql_vector_idx(embedding))"
         )
+        self._init_fts()
         self._conn.commit()
+        log.info("hybrid memory ready (embedder=%s dim=%d db=%s)", self.embedder.name, self.dim, self.db_path)
+
+    def _init_fts(self) -> None:
+        existed = bool(
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_fts'"
+            ).fetchone()
+        )
+        self._conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts "
+            "USING fts5(content, content='memory_entries', content_rowid='id')"
+        )
+        self._conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS memory_entries_ai
+            AFTER INSERT ON memory_entries BEGIN
+                INSERT INTO memory_fts(rowid, content) VALUES (new.id, new.content);
+            END
+            """
+        )
+        if not existed:
+            self._conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
 
     # --- read --------------------------------------------------------------
     async def search(self, query: str, options: SearchOptions | None = None) -> list[MemoryEntry]:
         limit = int((options or {}).get("max_search_results") or self.max_search_results)
-        qvec = _vector_literal(self.embedder.embed_one(query))
-        sql = """
-            SELECT m.content, m.metadata, m.kind, m.author, m.channel,
-                   m.team, m.source, m.thread_ts, m.created_at
-            FROM vector_top_k('memory_vec_idx', vector32(?), ?) AS v
-            JOIN memory_entries m ON m.rowid = v.id
-            ORDER BY m.created_at DESC
-        """
+        pool = max(limit * 4, 20)
         with self._lock:
-            rows = self._conn.execute(sql, (qvec, limit)).fetchall()
-        return [self._row_to_entry(row) for row in rows]
+            lexical = self._lexical_ids(query, pool)
+            semantic = self._semantic_ids(query, pool)
+            ranked = _rrf_fuse(lexical, semantic)[:limit]
+            if not ranked:
+                return []
+            rows = self._fetch(ranked)
+        return [self._row_to_entry(rows[i]) for i in ranked if i in rows]
+
+    def _lexical_ids(self, query: str, pool: int) -> list[int]:
+        match = _fts_match(query)
+        if not match:
+            return []
+        try:
+            rows = self._conn.execute(
+                "SELECT f.rowid FROM memory_fts f WHERE memory_fts MATCH ? "
+                "ORDER BY bm25(memory_fts) LIMIT ?",
+                (match, pool),
+            ).fetchall()
+            return [int(r[0]) for r in rows]
+        except Exception as err:  # noqa: BLE001
+            log.warning("lexical search failed: %s", err)
+            return []
+
+    def _semantic_ids(self, query: str, pool: int) -> list[int]:
+        try:
+            qvec = _vector_literal(self.embedder.embed_one(query))
+            rows = self._conn.execute(
+                "SELECT id FROM vector_top_k('memory_vec_idx', vector32(?), ?)",
+                (qvec, pool),
+            ).fetchall()
+            return [int(r[0]) for r in rows]
+        except Exception as err:  # noqa: BLE001
+            log.warning("semantic search failed: %s", err)
+            return []
+
+    def _fetch(self, ids: list[int]) -> dict[int, tuple]:
+        placeholders = ",".join("?" * len(ids))
+        rows = self._conn.execute(
+            f"""
+            SELECT id, content, metadata, kind, author, channel, team, source, thread_ts, created_at
+            FROM memory_entries WHERE id IN ({placeholders})
+            """,
+            tuple(ids),
+        ).fetchall()
+        return {int(r[0]): r[1:] for r in rows}
 
     def _row_to_entry(self, row: tuple) -> MemoryEntry:
         content, meta_json, kind, author, channel, team, source, thread_ts, created_at = row
@@ -152,6 +216,12 @@ class LibsqlVectorMemoryStore:
         vec = _vector_literal(self.embedder.embed_one(content))
 
         with self._lock:
+            dup = self._conn.execute(
+                "SELECT id FROM memory_entries WHERE content = ? LIMIT 1", (content,)
+            ).fetchone()
+            if dup:
+                log.info("memory dedup: identical content already stored id=%s", dup[0])
+                return int(dup[0])
             cur = self._conn.execute(
                 """
                 INSERT INTO memory_entries
@@ -165,6 +235,24 @@ class LibsqlVectorMemoryStore:
             )
             self._conn.commit()
             rid = int(getattr(cur, "lastrowid", 0) or 0)
-        log.info("vector memory stored id=%s author=%s channel=%s chars=%d",
+        log.info("hybrid memory stored id=%s author=%s channel=%s chars=%d",
                  rid, cols["author"], cols["channel"], len(content))
         return rid
+
+
+def _rrf_fuse(*ranked_lists: list[int]) -> list[int]:
+    """Reciprocal Rank Fusion: score = Σ 1/(k + rank). Higher = better; ties keep
+    first-seen order. A doc strong on either retriever surfaces; strong on both wins."""
+    scores: dict[int, float] = {}
+    order: list[int] = []
+    for ids in ranked_lists:
+        for rank, doc_id in enumerate(ids):
+            if doc_id not in scores:
+                scores[doc_id] = 0.0
+                order.append(doc_id)
+            scores[doc_id] += 1.0 / (_RRF_K + rank)
+    return sorted(order, key=lambda d: scores[d], reverse=True)
+
+
+# Back-compat alias (the backend selector + older imports use this name).
+LibsqlVectorMemoryStore = HybridMemoryStore

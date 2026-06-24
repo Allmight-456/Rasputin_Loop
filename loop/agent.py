@@ -168,16 +168,17 @@ def _format_memories(ctx: InjectionFormatContext) -> str:
 def _memory_store() -> Any:
     """Pick the memory backend from env.
 
-    Default ``sqlite`` = the FTS5 + provenance store on `main` (no deps, no key).
-    ``libsql`` = the experimental semantic vector store (this branch); if its
-    deps are missing it raises a clear error, so the choice is explicit.
+    Default ``sqlite`` = the FTS5 + provenance store (no deps, no key). ``hybrid``
+    (aliases: ``libsql``/``turso``/``vector``) = the libSQL/Turso hybrid store
+    (FTS5 + semantic vectors, RRF-fused); needs ``pip install "loop[vector]"`` and
+    raises a clear error if missing, so the choice is explicit.
     """
     backend = os.environ.get("LOOP_MEMORY_BACKEND", "sqlite").strip().lower()
-    if backend in {"libsql", "turso", "vector"}:
-        from loop.vector_store import LibsqlVectorMemoryStore  # noqa: PLC0415 (optional path)
+    if backend in {"hybrid", "libsql", "turso", "vector"}:
+        from loop.vector_store import HybridMemoryStore  # noqa: PLC0415 (optional path)
 
-        log.info("memory backend: libsql/turso (semantic vector search)")
-        return LibsqlVectorMemoryStore()
+        log.info("memory backend: libsql/turso hybrid (FTS5 + semantic vectors, RRF-fused)")
+        return HybridMemoryStore()
     return SqliteMemoryStore()
 
 
