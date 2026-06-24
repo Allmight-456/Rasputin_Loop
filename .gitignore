@@ -15,6 +15,7 @@ dist/
 # Strands agent state — KEEP the conversation DB, drop the transient SQLite sidecars
 data/*
 !data/loop.db
+!data/loop_vec.db
 *.db-shm
 *.db-wal
 
