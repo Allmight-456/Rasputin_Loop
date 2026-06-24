@@ -238,6 +238,8 @@ def _build_app(cfg: AppConfig) -> App:
             log.exception("[%s] slash command failed rid=%s", cfg.name, ix.request_id)
             respond(f":warning: Something went wrong: {err}")
 
+    if _assistant_enabled():
+        _attach_assistant(app, cfg)
     return app
 
 
@@ -258,6 +260,82 @@ def _ctx_cmd(command: dict) -> dict:
         "channel_type": "slash",
         "team": command.get("team_id"),
     }
+
+
+# ── Native Slack AI "Assistant" surface (Slack AI capabilities) ───────────────
+# Opt-in via LOOP_SLACK_ASSISTANT=on. Requires, on the Slack app: the "Agents & AI
+# Apps" feature enabled, the `assistant:write` scope, and the `assistant_thread_*`
+# events subscribed. Routes the same single Strands agent into the assistant pane
+# (side panel / app DM) with suggested prompts + a live "is thinking…" status.
+_SUGGESTED_PROMPTS = [
+    {"title": "Recall a decision", "message": "What did we decide about our database?"},
+    {"title": "Summarize this channel", "message": "Summarize the latest messages in this channel."},
+    {"title": "Remember something", "message": "Remember that our standup is at 10am every weekday."},
+]
+
+
+def _assistant_enabled() -> bool:
+    return os.environ.get("LOOP_SLACK_ASSISTANT", "off").strip().lower() in {"on", "1", "true", "yes"}
+
+
+def _attach_assistant(app: "App", cfg: "AppConfig") -> None:
+    """Wire Bolt's Assistant (AI app pane) to the same agent. Best-effort: if this
+    slack_bolt build lacks the Assistant class, log and skip rather than crash."""
+    try:
+        from slack_bolt import Assistant
+    except Exception:  # noqa: BLE001 — older bolt without Assistant
+        log.warning("[%s] slack_bolt has no Assistant class; assistant disabled", cfg.name)
+        return
+
+    assistant = Assistant()
+
+    @assistant.thread_started
+    def _started(say, set_suggested_prompts, logger):
+        say(":wave: Hi! I'm *Loop*. Ask me to recall a decision, summarize a channel, or remember something.")
+        try:
+            set_suggested_prompts(prompts=_SUGGESTED_PROMPTS, title="Try one of these:")
+        except Exception:  # noqa: BLE001
+            logger.exception("[%s] set_suggested_prompts failed", cfg.name)
+
+    @assistant.user_message
+    def _on_message(payload, client, set_status, say, logger, context):
+        text = _strip_mentions(payload.get("text", "") or "")
+        attachments = _collect_files(payload, client)
+        if not text and not attachments:
+            return
+        try:
+            set_status("is thinking…")
+        except Exception:  # noqa: BLE001
+            pass
+        ix = obs.Interaction(
+            entrypoint=f"{cfg.name}:assistant",
+            team=context.get("team_id") or payload.get("team"),
+            channel=payload.get("channel"),
+            channel_type="assistant",
+            user=payload.get("user"),
+            thread_ts=payload.get("thread_ts"),
+            prompt=text or "(see attached file)",
+        )
+        log.info("[%s] assistant rid=%s channel=%s user=%s files=%d",
+                 cfg.name, ix.request_id, ix.channel, ix.user, len(attachments))
+        try:
+            with obs.record(ix):
+                run = run_agent(
+                    ix.prompt, attachments=attachments,
+                    context={
+                        "user": ix.user, "channel": ix.channel, "channel_type": "assistant",
+                        "team": ix.team, "thread_ts": ix.thread_ts,
+                    },
+                    request_id=ix.request_id, app_name=cfg.name,
+                )
+                ix.from_run(run)
+                say(text=run.text or "_(no response)_")
+        except Exception as err:  # noqa: BLE001
+            logger.exception("[%s] assistant turn failed rid=%s", cfg.name, ix.request_id)
+            say(text=f":warning: Something went wrong: {err}")
+
+    app.assistant(assistant)
+    log.info("[%s] Slack AI Assistant attached (needs assistant:write + Agents & AI Apps)", cfg.name)
 
 
 def _react(client, channel: str, ts: str, name: str) -> None:
