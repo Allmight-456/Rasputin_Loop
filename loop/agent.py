@@ -165,12 +165,28 @@ def _format_memories(ctx: InjectionFormatContext) -> str:
     return f"<memory>\n{body}\n</memory>" if body else ""
 
 
+def _memory_store() -> Any:
+    """Pick the memory backend from env.
+
+    Default ``sqlite`` = the FTS5 + provenance store on `main` (no deps, no key).
+    ``libsql`` = the experimental semantic vector store (this branch); if its
+    deps are missing it raises a clear error, so the choice is explicit.
+    """
+    backend = os.environ.get("LOOP_MEMORY_BACKEND", "sqlite").strip().lower()
+    if backend in {"libsql", "turso", "vector"}:
+        from loop.vector_store import LibsqlVectorMemoryStore  # noqa: PLC0415 (optional path)
+
+        log.info("memory backend: libsql/turso (semantic vector search)")
+        return LibsqlVectorMemoryStore()
+    return SqliteMemoryStore()
+
+
 def _build_agent(app_name: str | None = None) -> Agent:
     """Build an agent for one app. Caller is responsible for holding any MCP context."""
     tools: list[Any] = [slack, slack_send_message, calculator, think]
 
     memory_manager = MemoryManager(
-        stores=[SqliteMemoryStore()],
+        stores=[_memory_store()],
         search_tool_config=True,
         add_tool_config=True,
         injection=MemoryInjectionConfig(format=_format_memories),

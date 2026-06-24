@@ -13,6 +13,14 @@ dependencies = [
     "pypdf>=4.0.0",
 ]
 
+[project.optional-dependencies]
+# Experimental semantic memory (feat/vector-memory-turso): libSQL/Turso native
+# vector search + local embeddings. fastembed runs in-process (no API key).
+vector = [
+    "libsql-experimental>=0.0.40",
+    "fastembed>=0.4.0",
+]
+
 [project.scripts]
 loop = "loop.main:main"
 loop-eval = "loop.eval:main"
