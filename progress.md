@@ -135,8 +135,8 @@ prompt edit could silently regress quality and we'd never know.
 ---
 
 ## Status log
-- **2026-06-30 (feat/provider-factory-claude-tag)** — **Claude-Tag-inspired
-    capabilities on a provider-agnostic stack (branch, not yet merged).** Built in
+- **2026-07-01 (feat/provider-factory-claude-tag → main)** — **Claude-Tag-inspired
+    capabilities on a provider-agnostic stack — merged to main, verified live.** Built in
     response to Anthropic's Claude Tag launch; the USP is the one thing Claude Tag
     can't be — open + provider-agnostic + self-hostable. Four workstreams:
     **(A) Provider factory** — `agent._build_model()` is now env-selected
@@ -154,18 +154,24 @@ prompt edit could silently regress quality and we'd never know.
     Verified live on both backends incl. semantic isolation; +2 regression tests
     (`test_channel_scope_*`), suite 9/9.
     **(C) Ambient PM mode** — new `loop/ambient.py`, off unless `LOOP_AMBIENT=on`;
-    `maybe_start()` spawns a daemon per app from `slack_app.start()`. Pluggable
-    discovery (narrow default = `interactions` table; enterprise full-channel-scan
-    drops in later), live staleness re-check via `conversations_replies`, re-nudge
-    guard, posts via the **per-app** Web client (sidesteps the bare-`SLACK_BOT_TOKEN`
-    identity of `slack_send_message`), wrapped in `obs.record` (`<app>:ambient`).
-    Logic verified with stubs (discovery/staleness/NOOP/post/re-nudge all correct).
+    `maybe_start()` spawns a daemon per app from `slack_app.start()`. **Two discovery
+    modes** via `LOOP_AMBIENT_DISCOVERY`: `interactions` (narrow default = threads we
+    touched, from the telemetry DB) and `channels` (**full-channel scan** via
+    `conversations_history`, needs `channels:read`+`channels:history`). Live staleness
+    re-check via `conversations_replies`, re-nudge guard, posts via the **per-app** Web
+    client (sidesteps the bare-`SLACK_BOT_TOKEN` identity of `slack_send_message`),
+    wrapped in `obs.record` (`<app>:ambient`). Unit tests in `tests/test_ambient.py`
+    (5). **Verified LIVE 2026-07-01:** Rasputin_Loop, full-channel scan over
+    #new-channel, posted two well-formed PM nudges in-thread on stalled questions
+    (`rasputin:ambient` rows recorded, MiniMax-M3, no guardrail hits).
     **(D) Sandbox via MCP** — documented only: point `LOOP_MCP_SERVERS` at a
     code-exec MCP server (zero core code; per-request rebuild). Single-server MCP
-    limitation noted. **Open:** wire `loop-eval` provider A/B; live Slack test of
-    ambient nudges; enterprise track (authz, PII, VPC memory, full-scan ambient,
-    self-hosted sandbox). `.env.example` documents every new var. Not merged
-    (branch discipline — needs live Slack verification first).
+    limitation noted. **Evals:** `loop-eval` 25/28 live on MiniMax-M3; +3
+    `memory-scope` golden cases (channel isolation through the real agent, all pass);
+    3 failures are M3 tool-happiness on smalltalk/safety (pass on retry, unrelated to
+    the diff). **Open:** `loop-eval` provider A/B + CI gate; enterprise track (authz,
+    PII, per-workspace DB isolation, ambient rate/cost caps, self-hosted in-VPC
+    sandbox). `.env.example` documents every new var.
 - **2026-06-24 (v0.4.0)** — **Hybrid RAG memory + Slack AI Assistant merged to
   `main`, verified live.** With the MiniMax key (in `ANTHROPIC_AUTH_TOKEN`) and
   `assistant:write` granted on Rasputin_Loop, both branches were tested and
