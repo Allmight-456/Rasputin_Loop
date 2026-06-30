@@ -54,3 +54,8 @@ loop
 - Provider choice stays env-driven; don't hardcode a provider in code.
 - Before adding features, weigh the roadmap in `progress.md`: observability
   (Pillar 02) and evaluation (Pillar 01) are the highest-ROI gaps.
+- **Every new feature extends the eval set.** The golden dataset
+  (`evals/golden.json`) is required — add case(s) for the new behavior and at
+  least partial tests. Features that aren't single-turn agent behaviors (infra
+  like the provider factory; background loops like ambient mode) are covered by
+  unit tests in `tests/` instead, since the golden runner scores one agent turn.
