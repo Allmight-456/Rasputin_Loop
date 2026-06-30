@@ -62,25 +62,36 @@ final text → Slack thread;  one JSON telemetry line + interactions row recorde
 | `loop/guardrails.py` | `Guardrails` (`HookProvider`): enforcing tool-call limits via `cancel_tool`, with per-rule env toggles. |
 | `loop/observability.py` | `Interaction` + `record()` (edge telemetry), `record_step()`, `record_eval()`; owns the `interactions` / `steps` / `eval_results` tables. |
 | `loop/eval.py` | `loop-eval` CLI: runs `evals/golden.json` through the real agent and scores tool selection + reply expectations. |
+| `loop/ambient.py` | **Ambient (proactive PM) mode** — off unless `LOOP_AMBIENT=on`. `maybe_start(configs)` (called from `slack_app.start()`) spawns one daemon thread per app. Each tick discovers stalled threads (pluggable `Discoverer`; default `discover_from_interactions` = threads the app touched whose last non-ambient activity is older than `LOOP_AMBIENT_STALE_HOURS`), re-checks real staleness via `conversations_replies`, skips recently-nudged threads, runs the agent (optionally on `LOOP_AMBIENT_MODEL`) to draft a nudge or `NOOP`, and posts via the **per-app** Web client (avoids the bare-`SLACK_BOT_TOKEN` identity of `slack_send_message`). Wrapped in `obs.record` with entrypoint `<app>:ambient`. |
 | `loop/storage.py` | `SqliteMemoryStore` (default backend) — Strands `MemoryStore` over local SQLite. **Episodic + provenance-stamped:** every memory auto-tagged with who/where/when (from `RequestState`); recall is **FTS5** (BM25 + recency) with a sanitized query + `LIKE` fallback; exact-content dedup on write. |
 | `loop/vector_store.py` | `HybridMemoryStore` (opt-in, `LOOP_MEMORY_BACKEND=hybrid`) — same contract over **libSQL/Turso**: fuses FTS5 (BM25) + native vector search (`F32_BLOB`/`vector_top_k`) via **Reciprocal Rank Fusion** for hybrid Agentic-RAG recall. Same provenance + dedup. |
 | `loop/embeddings.py` | Pluggable text embedder for the hybrid store: `fastembed` (local, no key — default), `minimax`/`openai` (hosted), `hashing` (dep-free fallback). |
 | `loop/__init__.py` | Version marker (`0.3.1`). |
 
-## Model provider
+## Model provider — env-selected factory (no vendor lock-in)
 
-The agent uses Strands' `AnthropicModel`, which wraps the Anthropic Python SDK.
-Provider selection is **env-driven** (see `.env.example`):
+`agent._build_model()` is a **provider factory** chosen by `LOOP_MODEL_PROVIDER`
+(default `anthropic`). This is Loop's core differentiator vs single-vendor Slack
+agents: the brain is swappable by env, never hardcoded.
 
-- `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN` as fallback) — credential.
-- `ANTHROPIC_BASE_URL` — optional endpoint override.
-- `ANTHROPIC_MODEL` — model id (code default: `claude-sonnet-4-6`).
+- `anthropic` (default) — Strands `AnthropicModel` (the Anthropic SDK). Also serves
+  any **Anthropic-wire-compatible** endpoint (MiniMax M3, native Claude, proxies)
+  via `ANTHROPIC_BASE_URL`. Reads `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`.
+- `litellm` — LiteLLM multi-provider gateway (one class, many providers; model id
+  like `openai/gpt-4o`). `openai` — OpenAI / OpenAI-compatible. `bedrock` — AWS
+  Bedrock (works out of the box; boto3 ships with strands). `ollama` — local /
+  self-hosted (sovereign). `gemini` — Google Gemini.
+- Non-`anthropic` SDKs are **lazy-imported** (only required when selected); install
+  via `pip install "loop[providers]"`. Model id is provider-neutral via `LOOP_MODEL`
+  (falls back to `ANTHROPIC_MODEL`); response cap via `LOOP_MAX_TOKENS` (def 2048).
+- **Model routing:** `_build_model(model_id)` / `get_agent(app, model_id)` /
+  `run(..., model_id=…)` accept an override (cached under its own key) so ambient
+  background scans can run on a cheaper model (`LOOP_AMBIENT_MODEL`) — the cost lever.
 
-**Current target: MiniMax M3.** MiniMax exposes an Anthropic-compatible endpoint,
-so Loop runs on it with zero code change — just env:
+**Current target: MiniMax M3** (the default `anthropic` path), env:
 `ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic`, `ANTHROPIC_MODEL=MiniMax-M3`,
-and the MiniMax key in `ANTHROPIC_API_KEY`. Switching back to native Anthropic is
-also env-only.
+key in `ANTHROPIC_API_KEY`. Note: only Anthropic-wire-compatible providers are
+truly env-only; OpenAI/Bedrock/etc. go through the factory branches above.
 
 ## Database (storage layer)
 
@@ -145,10 +156,19 @@ All telemetry tables are opened on a separate connection from the memory store
   default). Verified live (memory add→recall through MiniMax M3). See
   `docs/vector-memory.md`.
 
+**Memory scope (per-channel isolation, Claude-Tag-style):** `LOOP_MEMORY_SCOPE`
+(default `channel`; `team`/`global`; per-app `LOOP_MEMORY_SCOPE_<NAME>`) controls
+what recall can see. A fact saved in #support is not recalled in #data-team. It's a
+**recall-time filter** (no migration — channel/team are already stamped): the active
+scope is read from `reqctx.memory_scope()` *inside* each store's `search()` (Strands'
+`MemoryManager` forwards only `max_search_results`, so scope can't be passed through
+it). SQLite store adds `AND channel = ?` to FTS/LIKE; the hybrid store scopes the
+lexical leg in SQL and **post-filters the semantic leg** (`vector_top_k` can't take a
+WHERE). Dedup is scoped to match (same fact in two channels = two rows under `channel`).
+
 **Remaining data-layer gaps (see `progress.md` Pillar 3):**
-- Scoping columns (channel/team/user) are stored and returned but `search()`
-  ranks globally; per-scope filtering is a small follow-up.
 - Dedup is exact-content only; near-duplicate (semantic) dedup is a future step.
+- Scope is a single-tenant filter; per-workspace **DB** isolation is enterprise-track.
 
 ## Extensibility — MCP tools at runtime
 

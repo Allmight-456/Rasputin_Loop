@@ -13,6 +13,7 @@ when no id is supplied a fresh one is generated.
 from __future__ import annotations
 
 import contextvars
+import os
 import threading
 import uuid
 from collections import Counter
@@ -77,3 +78,36 @@ def set_current(state: RequestState) -> contextvars.Token:
 
 def reset_current(token: contextvars.Token) -> None:
     _CURRENT.reset(token)
+
+
+def memory_scope() -> tuple[str, str] | None:
+    """The active memory-recall scope as ``(column, value)``, or ``None`` for no
+    filter (global recall).
+
+    This is what makes channel-isolated memory possible (Claude-Tag-style): a fact
+    saved in #support is not recalled in #data-team. Resolution order:
+    ``LOOP_MEMORY_SCOPE_<SOURCE>`` (per-app override, SOURCE = the Loop app name)
+    → ``LOOP_MEMORY_SCOPE`` → default ``channel``. Values:
+
+    * ``channel`` (default) — scope to the originating channel.
+    * ``team``              — scope to the workspace/team.
+    * ``global``            — no filter (legacy behavior).
+
+    Returns ``None`` (no filter) when scope is ``global``, when there's no active
+    request, or when the scoping column is empty on the request — so recall never
+    silently returns nothing just because provenance was missing.
+    """
+    state = current()
+    if state is None:
+        return None
+    source = (state.source or "").upper()
+    scope = (
+        os.environ.get(f"LOOP_MEMORY_SCOPE_{source}")
+        or os.environ.get("LOOP_MEMORY_SCOPE")
+        or "channel"
+    ).strip().lower()
+    if scope == "global":
+        return None
+    if scope == "team":
+        return ("team", state.team) if state.team else None
+    return ("channel", state.channel) if state.channel else None

@@ -58,19 +58,108 @@ class AgentRun:
     stop_reason: str | None = None
 
 
-def _build_model() -> AnthropicModel:
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN must be set")
+_DEFAULT_MODEL = "claude-sonnet-4-6"
 
-    client_args: dict[str, Any] = {"api_key": api_key}
-    if base_url := os.environ.get("ANTHROPIC_BASE_URL"):
-        client_args["base_url"] = base_url
 
-    return AnthropicModel(
-        client_args=client_args,
-        model_id=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-        max_tokens=2048,
+def _model_id() -> str:
+    """The model id, provider-neutral. ``LOOP_MODEL`` wins; ``ANTHROPIC_MODEL`` is
+    kept as the back-compat fallback (MiniMax M3 sets it today)."""
+    return os.environ.get("LOOP_MODEL") or os.environ.get("ANTHROPIC_MODEL", _DEFAULT_MODEL)
+
+
+def _max_tokens() -> int:
+    return int(os.environ.get("LOOP_MAX_TOKENS", "2048"))
+
+
+def _openai_style_client_args() -> dict[str, Any]:
+    """Client args for OpenAI-format clients (OpenAI/LiteLLM). Optional — LiteLLM
+    also reads provider keys straight from the environment."""
+    args: dict[str, Any] = {}
+    if key := (os.environ.get("OPENAI_API_KEY") or os.environ.get("LOOP_LLM_API_KEY")):
+        args["api_key"] = key
+    if base := (os.environ.get("OPENAI_BASE_URL") or os.environ.get("LOOP_LLM_BASE_URL")):
+        args["base_url"] = base
+    return args
+
+
+def _build_model(model_id: str | None = None) -> Any:
+    """Construct the Strands model for the configured provider.
+
+    This is Loop's USP made real: the provider is **env-selected** rather than
+    hardcoded, so the same agent can run on Anthropic, MiniMax, OpenAI, Bedrock,
+    a LiteLLM multi-provider gateway, or a local Ollama model — no vendor lock-in.
+    ``LOOP_MODEL_PROVIDER`` picks the backend (default ``anthropic``, which keeps
+    the existing MiniMax-M3-via-Anthropic-compatible-endpoint path unchanged).
+    Provider SDKs beyond ``anthropic`` are lazy-imported so they're only required
+    when actually selected (install via ``pip install "loop[providers]"``).
+
+    ``model_id`` overrides the env model id — used by the ambient loop for cheap
+    background scanning (``LOOP_AMBIENT_MODEL``).
+    """
+    provider = os.environ.get("LOOP_MODEL_PROVIDER", "anthropic").strip().lower()
+    model_id = model_id or _model_id()
+    max_tokens = _max_tokens()
+
+    # Anthropic SDK — also serves any Anthropic-wire-compatible endpoint
+    # (MiniMax M3, native Claude, compatible proxies) via ANTHROPIC_BASE_URL.
+    if provider in {"anthropic", "minimax", ""}:
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN must be set")
+        client_args: dict[str, Any] = {"api_key": api_key}
+        if base_url := os.environ.get("ANTHROPIC_BASE_URL"):
+            client_args["base_url"] = base_url
+        return AnthropicModel(client_args=client_args, model_id=model_id, max_tokens=max_tokens)
+
+    # LiteLLM gateway — one class, many providers (model_id like "openai/gpt-4o"
+    # or "anthropic/claude-3-7-sonnet"). The cleanest multi-provider story.
+    if provider == "litellm":
+        from strands.models.litellm import LiteLLMModel  # noqa: PLC0415
+
+        return LiteLLMModel(
+            client_args=_openai_style_client_args() or None,
+            model_id=model_id,
+            params={"max_tokens": max_tokens},
+        )
+
+    if provider == "openai":
+        from strands.models.openai import OpenAIModel  # noqa: PLC0415
+
+        return OpenAIModel(
+            client_args=_openai_style_client_args() or None,
+            model_id=model_id,
+            params={"max_tokens": max_tokens},
+        )
+
+    # AWS Bedrock — region-resident inference (boto3 already available).
+    if provider == "bedrock":
+        from strands.models.bedrock import BedrockModel  # noqa: PLC0415
+
+        kwargs: dict[str, Any] = {"model_id": model_id, "max_tokens": max_tokens}
+        if region := (os.environ.get("LOOP_BEDROCK_REGION") or os.environ.get("AWS_REGION")):
+            kwargs["region_name"] = region
+        return BedrockModel(**kwargs)
+
+    # Local / self-hosted models via Ollama — fully sovereign, no external calls.
+    if provider == "ollama":
+        from strands.models.ollama import OllamaModel  # noqa: PLC0415
+
+        host = os.environ.get("LOOP_OLLAMA_HOST", "http://localhost:11434")
+        return OllamaModel(host=host, model_id=model_id, max_tokens=max_tokens)
+
+    if provider == "gemini":
+        from strands.models.gemini import GeminiModel  # noqa: PLC0415
+
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        return GeminiModel(
+            client_args={"api_key": api_key} if api_key else None,
+            model_id=model_id,
+            params={"max_tokens": max_tokens},
+        )
+
+    raise RuntimeError(
+        f"Unknown LOOP_MODEL_PROVIDER={provider!r}. "
+        "Supported: anthropic (default), litellm, openai, bedrock, ollama, gemini."
     )
 
 
@@ -184,8 +273,11 @@ def _memory_store() -> Any:
     return SqliteMemoryStore()
 
 
-def _build_agent(app_name: str | None = None) -> Agent:
-    """Build an agent for one app. Caller is responsible for holding any MCP context."""
+def _build_agent(app_name: str | None = None, model_id: str | None = None) -> Agent:
+    """Build an agent for one app. Caller is responsible for holding any MCP context.
+
+    ``model_id`` overrides the env model — used for cost-routed background runs.
+    """
     tools: list[Any] = [slack, slack_send_message, calculator, think]
 
     memory_manager = MemoryManager(
@@ -196,7 +288,7 @@ def _build_agent(app_name: str | None = None) -> Agent:
     )
 
     return Agent(
-        model=_build_model(),
+        model=_build_model(model_id),
         system_prompt=_system_prompt(app_name),
         tools=tools,
         memory_manager=memory_manager,
@@ -205,12 +297,18 @@ def _build_agent(app_name: str | None = None) -> Agent:
     )
 
 
-def get_agent(app_name: str | None = None) -> Agent:
-    """Return the cached agent for `app_name` (one agent per Slack app)."""
+def get_agent(app_name: str | None = None, model_id: str | None = None) -> Agent:
+    """Return the cached agent for `app_name` (one agent per Slack app).
+
+    A non-default `model_id` is cached under its own key so cost-routed runs
+    (e.g. ambient scanning on a cheaper model) don't evict the primary agent.
+    """
     key = app_name or "_default"
+    if model_id:
+        key = f"{key}#{model_id}"
     agent = _agents.get(key)
     if agent is None:
-        agent = _build_agent(app_name)
+        agent = _build_agent(app_name, model_id)
         _agents[key] = agent
         log.info("loop agent initialised (app=%s)", key)
     return agent
@@ -223,6 +321,7 @@ def run(
     context: dict[str, Any] | None = None,
     request_id: str | None = None,
     app_name: str | None = None,
+    model_id: str | None = None,
 ) -> AgentRun:
     """Invoke the agent and return its reply plus telemetry (`AgentRun`).
 
@@ -247,11 +346,11 @@ def run(
     try:
         client = _mcp_client()
         if client is None:
-            return _result_to_run(get_agent(app_name)(message), state)
+            return _result_to_run(get_agent(app_name, model_id)(message), state)
         with client:
-            tools = list(get_agent(app_name).tool_registry.registry.values())
+            tools = list(get_agent(app_name, model_id).tool_registry.registry.values())
             tools.extend(client.list_tools_sync())
-            agent = _build_agent(app_name)
+            agent = _build_agent(app_name, model_id)
             agent.tool_registry.process_tools(tools)
             return _result_to_run(agent(message), state)
     finally:
@@ -337,7 +436,7 @@ def _result_to_run(result: Any, state: reqctx.RequestState | None = None) -> Age
     """Pull text + metrics off a Strands AgentResult, folding in the per-request
     counters the hooks accumulated (model calls, ordered tool calls, guardrail
     hits, reasoning)."""
-    model_id = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    model_id = _model_id()
     usage: dict[str, Any] = {}
     tool_calls: list[str] = []
     metrics = getattr(result, "metrics", None)

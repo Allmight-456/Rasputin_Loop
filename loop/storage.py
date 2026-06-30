@@ -60,6 +60,20 @@ def _ensure_parent(path: str) -> None:
     Path(path).resolve().parent.mkdir(parents=True, exist_ok=True)
 
 
+def _scope_clause(prefix: str = "") -> tuple[str, tuple[str, ...]]:
+    """SQL fragment + params for the active memory scope (channel/team isolation).
+
+    Returns ``("", ())`` for global recall. ``prefix`` qualifies the column for a
+    join (e.g. ``"m."``). Reads the scope from the active request via
+    ``loop.context.memory_scope`` — the Strands MemoryManager forwards no custom
+    search fields, so scope is read here (mirroring how ``add()`` reads provenance)."""
+    scope = reqctx.memory_scope()
+    if not scope:
+        return "", ()
+    col, val = scope
+    return f" AND {prefix}{col} = ?", (val,)
+
+
 def _fts_match(query: str) -> str | None:
     """Turn a natural-language query into a safe FTS5 MATCH expression.
 
@@ -178,34 +192,36 @@ class SqliteMemoryStore:
         match = _fts_match(query)
         if not match:
             return self._search_like(query, limit)  # nothing to match — recent-ish via LIKE
-        sql = """
+        scope_sql, scope_params = _scope_clause("m.")
+        sql = f"""
             SELECT m.content, m.metadata, m.kind, m.author, m.channel,
                    m.team, m.source, m.thread_ts, m.created_at
             FROM memory_fts f
             JOIN memory_entries m ON m.id = f.rowid
-            WHERE memory_fts MATCH ?
+            WHERE memory_fts MATCH ?{scope_sql}
             ORDER BY bm25(memory_fts), m.created_at DESC
             LIMIT ?
         """
         try:
             with self._lock:
-                return self._conn.execute(sql, (match, limit)).fetchall()
+                return self._conn.execute(sql, (match, *scope_params, limit)).fetchall()
         except sqlite3.OperationalError as err:
             log.warning("FTS search failed (%s); falling back to LIKE", err)
             return None
 
     def _search_like(self, query: str, limit: int) -> list[tuple]:
+        scope_sql, scope_params = _scope_clause()
         with self._lock:
             return self._conn.execute(
-                """
+                f"""
                 SELECT content, metadata, kind, author, channel,
                        team, source, thread_ts, created_at
                 FROM memory_entries
-                WHERE content LIKE ?
+                WHERE content LIKE ?{scope_sql}
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                (f"%{query}%", limit),
+                (f"%{query}%", *scope_params, limit),
             ).fetchall()
 
     def _row_to_entry(self, row: tuple) -> MemoryEntry:
@@ -251,9 +267,14 @@ class SqliteMemoryStore:
         cols = {c: merged.get(c) for c in _PROVENANCE_COLS}
         meta_json = json.dumps(merged, ensure_ascii=False, default=str) if merged else None
 
+        # Dedup within the active scope: under channel isolation the same fact in
+        # two channels must remain two rows, so the dedup check is scoped the same
+        # way recall is (global dedup only when scope is global).
+        scope_sql, scope_params = _scope_clause()
         with self._lock:
             dup = self._conn.execute(
-                "SELECT id FROM memory_entries WHERE content = ? LIMIT 1", (content,)
+                f"SELECT id FROM memory_entries WHERE content = ?{scope_sql} LIMIT 1",
+                (content, *scope_params),
             ).fetchone()
             if dup:
                 log.info("memory dedup: identical content already stored id=%s", dup[0])
