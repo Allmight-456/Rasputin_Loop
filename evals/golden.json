@@ -155,5 +155,26 @@
     "category": "memory",
     "prompt": "where do we keep the runbook for handling outages?",
     "expect": { "must_contain": ["notion"], "must_not_contain": ["Traceback"] }
+  },
+  {
+    "id": "mem-scope-add",
+    "category": "memory-scope",
+    "prompt": "please remember: the project codename for this channel is Zephyr-9.",
+    "context": { "user": "U_EVAL", "channel": "C_SCOPE_A", "channel_type": "channel" },
+    "expect": { "must_use_tools": ["add_memory"] }
+  },
+  {
+    "id": "mem-scope-recall-same-channel",
+    "category": "memory-scope",
+    "prompt": "what is our project codename?",
+    "context": { "user": "U_EVAL", "channel": "C_SCOPE_A", "channel_type": "channel" },
+    "expect": { "must_contain": ["zephyr"], "must_not_contain": ["Traceback"] }
+  },
+  {
+    "id": "mem-scope-recall-other-channel",
+    "category": "memory-scope",
+    "prompt": "what is the project codename for this channel, if any?",
+    "context": { "user": "U_EVAL", "channel": "C_SCOPE_B", "channel_type": "channel" },
+    "expect": { "must_not_contain": ["zephyr", "Traceback"] }
   }
 ]

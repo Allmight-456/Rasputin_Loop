@@ -9,7 +9,9 @@ No network, no API key, no model calls — pure storage-layer checks.
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from loop import context as reqctx
@@ -21,6 +23,67 @@ from strands.memory import InjectionFormatContext
 def _store() -> SqliteMemoryStore:
     tmp = Path(tempfile.mkdtemp()) / "mem.db"
     return SqliteMemoryStore(db_path=str(tmp))
+
+
+def _req(channel: str, team: str = "T1", source: str = "loop") -> reqctx.RequestState:
+    s = reqctx.RequestState()
+    s.channel, s.team, s.source = channel, team, source
+    return s
+
+
+@contextmanager
+def _scope(value: str):
+    """Temporarily set LOOP_MEMORY_SCOPE, restoring the prior value after."""
+    prev = os.environ.get("LOOP_MEMORY_SCOPE")
+    os.environ["LOOP_MEMORY_SCOPE"] = value
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("LOOP_MEMORY_SCOPE", None)
+        else:
+            os.environ["LOOP_MEMORY_SCOPE"] = prev
+
+
+def _add_in(store: SqliteMemoryStore, channel: str, content: str) -> int:
+    tok = reqctx.set_current(_req(channel))
+    try:
+        return asyncio.run(store.add(content))
+    finally:
+        reqctx.reset_current(tok)
+
+
+def _search_in(store: SqliteMemoryStore, channel: str, query: str) -> list:
+    tok = reqctx.set_current(_req(channel))
+    try:
+        return asyncio.run(store.search(query))
+    finally:
+        reqctx.reset_current(tok)
+
+
+def test_channel_scope_isolates_recall() -> None:
+    store = _store()
+    with _scope("channel"):
+        _add_in(store, "C_SUPPORT", "On-call owner this week is Alice.")
+        same = _search_in(store, "C_SUPPORT", "on-call owner")
+        assert same and "Alice" in same[0].content, "same-channel recall should work"
+        other = _search_in(store, "C_DATA", "on-call owner")
+        assert other == [], f"channel isolation failed; leaked: {[e.content for e in other]}"
+    with _scope("global"):
+        glob = _search_in(store, "C_DATA", "on-call owner")
+        assert glob and "Alice" in glob[0].content, "global scope should see across channels"
+
+
+def test_channel_scope_dedup_keeps_per_channel_copy() -> None:
+    store = _store()
+    with _scope("channel"):
+        id1 = _add_in(store, "C_A", "Shared fact.")
+        id2 = _add_in(store, "C_B", "Shared fact.")  # same content, different channel
+        assert id1 != id2, "same fact in two channels must be two rows under channel scope"
+    n = store._conn.execute(
+        "SELECT count(*) FROM memory_entries WHERE content='Shared fact.'"
+    ).fetchone()[0]
+    assert n == 2, f"expected 2 rows (one per channel), found {n}"
 
 
 def test_fts_match_sanitizes() -> None:

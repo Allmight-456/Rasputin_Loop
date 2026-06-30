@@ -365,4 +365,8 @@ def start() -> None:  # pragma: no cover
         handler.connect()  # non-blocking: opens this app's socket on a background thread
         log.info("loop: Slack app %r connected (socket mode)", cfg.name)
     log.info("loop: %d app(s) running: %s", len(configs), ", ".join(c.name for c in configs))
+    # Ambient (proactive PM) mode — off unless LOOP_AMBIENT=on; one daemon per app.
+    from loop import ambient  # noqa: PLC0415 (optional path; keeps import cost off the default)
+
+    ambient.maybe_start(configs)
     threading.Event().wait()  # block forever; each app runs in its own background thread

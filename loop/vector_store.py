@@ -53,6 +53,18 @@ def _vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
+# Position of each scopeable column inside the row tuple `_fetch` returns
+# (content, metadata, kind, author, channel, team, source, thread_ts, created_at).
+_SCOPE_IDX = {"channel": 4, "team": 5}
+
+
+def _row_in_scope(row: tuple, scope: tuple[str, str]) -> bool:
+    """True if a fetched row satisfies the active (column, value) scope. Used to
+    post-filter semantic hits, which `vector_top_k` can't scope in SQL."""
+    col, val = scope
+    return row[_SCOPE_IDX[col]] == val
+
+
 class HybridMemoryStore:
     """Hybrid lexical+semantic long-term memory over libSQL/Turso."""
 
@@ -133,24 +145,38 @@ class HybridMemoryStore:
     async def search(self, query: str, options: SearchOptions | None = None) -> list[MemoryEntry]:
         limit = int((options or {}).get("max_search_results") or self.max_search_results)
         pool = max(limit * 4, 20)
+        scope = reqctx.memory_scope()  # channel/team isolation, or None for global
         with self._lock:
-            lexical = self._lexical_ids(query, pool)
-            semantic = self._semantic_ids(query, pool)
-            ranked = _rrf_fuse(lexical, semantic)[:limit]
-            if not ranked:
+            lexical = self._lexical_ids(query, pool, scope)  # scoped in SQL via join
+            semantic = self._semantic_ids(query, pool)        # over-fetched; scoped below
+            fused = _rrf_fuse(lexical, semantic)
+            if not fused:
                 return []
-            rows = self._fetch(ranked)
-        return [self._row_to_entry(rows[i]) for i in ranked if i in rows]
+            rows = self._fetch(fused)
+        # Keep RRF order; drop semantic hits out of scope; cap at limit.
+        out: list[MemoryEntry] = []
+        for i in fused:
+            row = rows.get(i)
+            if row is None or (scope and not _row_in_scope(row, scope)):
+                continue
+            out.append(self._row_to_entry(row))
+            if len(out) >= limit:
+                break
+        return out
 
-    def _lexical_ids(self, query: str, pool: int) -> list[int]:
+    def _lexical_ids(self, query: str, pool: int, scope: tuple[str, str] | None = None) -> list[int]:
         match = _fts_match(query)
         if not match:
             return []
+        scope_sql, scope_params = ("", ())
+        if scope:
+            scope_sql = f" AND m.{scope[0]} = ?"
+            scope_params = (scope[1],)
         try:
             rows = self._conn.execute(
-                "SELECT f.rowid FROM memory_fts f WHERE memory_fts MATCH ? "
-                "ORDER BY bm25(memory_fts) LIMIT ?",
-                (match, pool),
+                "SELECT f.rowid FROM memory_fts f JOIN memory_entries m ON m.id = f.rowid "
+                f"WHERE memory_fts MATCH ?{scope_sql} ORDER BY bm25(memory_fts) LIMIT ?",
+                (match, *scope_params, pool),
             ).fetchall()
             return [int(r[0]) for r in rows]
         except Exception as err:  # noqa: BLE001
@@ -215,9 +241,17 @@ class HybridMemoryStore:
         meta_json = json.dumps(merged, ensure_ascii=False, default=str) if merged else None
         vec = _vector_literal(self.embedder.embed_one(content))
 
+        # Scope-aware dedup: under channel/team isolation the same fact in a
+        # different scope is a distinct row (mirrors recall scoping).
+        scope = reqctx.memory_scope()
+        dup_sql, dup_params = ("", ())
+        if scope:
+            dup_sql = f" AND {scope[0]} = ?"
+            dup_params = (scope[1],)
         with self._lock:
             dup = self._conn.execute(
-                "SELECT id FROM memory_entries WHERE content = ? LIMIT 1", (content,)
+                f"SELECT id FROM memory_entries WHERE content = ?{dup_sql} LIMIT 1",
+                (content, *dup_params),
             ).fetchone()
             if dup:
                 log.info("memory dedup: identical content already stored id=%s", dup[0])

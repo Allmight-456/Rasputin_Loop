@@ -70,8 +70,11 @@ memory is now **episodic + provenance-stamped + full-text searchable**.
       pluggable embeddings (`fastembed` local, no key). Merged to `main`, verified
       live (memory add→recall through MiniMax M3). See `docs/vector-memory.md`.
 - [x] Exact-content dedup on write (both backends).
-- [ ] Per-scope **filtering** in `search()` (columns + metadata are there; ranking
-      is still global).
+- [x] Per-scope **filtering** in `search()` — `LOOP_MEMORY_SCOPE` (channel default
+      / team / global; per-app override) gives Claude-Tag-style per-channel memory
+      isolation. Recall-time filter read from `reqctx.memory_scope()` inside each
+      store; hybrid store post-filters the semantic leg; dedup scoped to match.
+      Tested (`test_channel_scope_*`) + verified live on both backends.
 - [ ] Near-duplicate (semantic) dedup; the model can still re-save a re-phrased
       fact on recall (prompt nudge added; exact dups are caught).
 
@@ -79,9 +82,17 @@ memory is now **episodic + provenance-stamped + full-text searchable**.
 Guardrails add runaway-loop, repeat, and token-budget circuit breakers. Still
 synchronous/blocking; agent rebuilt per request when MCP is active; no thread context.
 - [x] Circuit breakers (max tool calls, repeats, token budget) via Strands hooks.
+- [x] **Provider factory** (`LOOP_MODEL_PROVIDER`): env-selected model backend
+      (anthropic/litellm/openai/bedrock/ollama/gemini) — no vendor lock-in — with
+      per-run model routing (`model_id` override) for cost-cheap background work.
+- [x] **Ambient mode** (`LOOP_AMBIENT`, off by default): daemon-per-app loop that
+      follows up on stalled threads (`loop/ambient.py`); pluggable discovery
+      (narrow default), live staleness re-check, re-nudge guard, per-app posting.
 - [ ] Timeouts, retries with backoff, graceful degradation on provider errors.
 - [ ] Non-blocking Slack handling (ack fast, process async).
-- [ ] Pass thread/conversation context; cache the MCP-augmented agent.
+- [ ] Cache the MCP-augmented agent; the MCP client is single-server today (one
+      stdio server) — running a sandbox MCP *and* another server needs a small
+      `_mcp_client()` extension.
 
 ### 05 — Governance · _What keeps you in production_  — ⚠️ partial
 The `interactions` table is now an audit trail (who/what/which tools), and a risky
@@ -124,6 +135,43 @@ prompt edit could silently regress quality and we'd never know.
 ---
 
 ## Status log
+- **2026-07-01 (feat/provider-factory-claude-tag → main)** — **Claude-Tag-inspired
+    capabilities on a provider-agnostic stack — merged to main, verified live.** Built in
+    response to Anthropic's Claude Tag launch; the USP is the one thing Claude Tag
+    can't be — open + provider-agnostic + self-hostable. Four workstreams:
+    **(A) Provider factory** — `agent._build_model()` is now env-selected
+    (`LOOP_MODEL_PROVIDER`: anthropic default / litellm / openai / bedrock / ollama
+    / gemini), non-anthropic SDKs lazy-imported behind a new `[providers]` extra;
+    default path unchanged (MiniMax M3 still works; verified live, MiniMax-M3 reply
+    through the factory). `LOOP_MODEL`/`LOOP_MAX_TOKENS` added; `model_id` override
+    threaded through `_build_model`/`get_agent`/`run` for cost-routed runs. Bedrock
+    constructs with zero new deps (boto3 vendored).
+    **(B) Per-channel memory isolation** — `LOOP_MEMORY_SCOPE` (channel default /
+    team / global; per-app `LOOP_MEMORY_SCOPE_<NAME>`). Recall-time filter via new
+    `reqctx.memory_scope()`, applied in `storage.py` (FTS+LIKE) and `vector_store.py`
+    (lexical leg in SQL, **semantic leg post-filtered** since `vector_top_k` can't
+    take a WHERE); dedup scoped to match. No migration (channel/team already stamped).
+    Verified live on both backends incl. semantic isolation; +2 regression tests
+    (`test_channel_scope_*`), suite 9/9.
+    **(C) Ambient PM mode** — new `loop/ambient.py`, off unless `LOOP_AMBIENT=on`;
+    `maybe_start()` spawns a daemon per app from `slack_app.start()`. **Two discovery
+    modes** via `LOOP_AMBIENT_DISCOVERY`: `interactions` (narrow default = threads we
+    touched, from the telemetry DB) and `channels` (**full-channel scan** via
+    `conversations_history`, needs `channels:read`+`channels:history`). Live staleness
+    re-check via `conversations_replies`, re-nudge guard, posts via the **per-app** Web
+    client (sidesteps the bare-`SLACK_BOT_TOKEN` identity of `slack_send_message`),
+    wrapped in `obs.record` (`<app>:ambient`). Unit tests in `tests/test_ambient.py`
+    (5). **Verified LIVE 2026-07-01:** Rasputin_Loop, full-channel scan over
+    #new-channel, posted two well-formed PM nudges in-thread on stalled questions
+    (`rasputin:ambient` rows recorded, MiniMax-M3, no guardrail hits).
+    **(D) Sandbox via MCP** — documented only: point `LOOP_MCP_SERVERS` at a
+    code-exec MCP server (zero core code; per-request rebuild). Single-server MCP
+    limitation noted. **Evals:** `loop-eval` 25/28 live on MiniMax-M3; +3
+    `memory-scope` golden cases (channel isolation through the real agent, all pass);
+    3 failures are M3 tool-happiness on smalltalk/safety (pass on retry, unrelated to
+    the diff). **Open:** `loop-eval` provider A/B + CI gate; enterprise track (authz,
+    PII, per-workspace DB isolation, ambient rate/cost caps, self-hosted in-VPC
+    sandbox). `.env.example` documents every new var.
 - **2026-06-24 (v0.4.0)** — **Hybrid RAG memory + Slack AI Assistant merged to
   `main`, verified live.** With the MiniMax key (in `ANTHROPIC_AUTH_TOKEN`) and
   `assistant:write` granted on Rasputin_Loop, both branches were tested and
